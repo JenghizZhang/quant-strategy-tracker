@@ -1,0 +1,25 @@
+name: Test Notion Connection
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-notion:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Test Notion API connection
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_MAIN_PAGE_ID: ${{ secrets.NOTION_MAIN_PAGE_ID }}
+          CURRENT_POSITIONS_DATA_SOURCE_ID: ${{ secrets.CURRENT_POSITIONS_DATA_SOURCE_ID }}
+          STRATEGY1_STATUS_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_STATUS_DATA_SOURCE_ID }}
+        run: python test_notion.py
