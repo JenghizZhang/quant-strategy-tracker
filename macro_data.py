@@ -391,7 +391,17 @@ def build_daily_unemployment_state(
     considered available for that day's close calculation.
     """
 
-    trading_index = pd.DatetimeIndex(pd.to_datetime(trading_dates)).normalize()
+    # Force a single datetime resolution before merge_asof.
+    # Pandas 3 / Python 3.12 can preserve different datetime units
+    # (for example datetime64[s] vs datetime64[us]), and merge_asof
+    # requires the join keys to have exactly matching dtypes.
+    trading_index = (
+        pd.DatetimeIndex(pd.to_datetime(trading_dates))
+        .tz_localize(None)
+        .normalize()
+        .astype("datetime64[ns]")
+    )
+
     if trading_index.empty:
         raise ValueError("trading_dates cannot be empty")
 
@@ -407,9 +417,16 @@ def build_daily_unemployment_state(
     if releases.empty:
         raise RuntimeError("Not enough unemployment history for a 12M average")
 
-    releases["Release Date"] = pd.to_datetime(releases["Release Date"]).dt.normalize()
+    releases["Release Date"] = (
+        pd.to_datetime(releases["Release Date"])
+        .dt.tz_localize(None)
+        .dt.normalize()
+        .astype("datetime64[ns]")
+    )
 
     left = pd.DataFrame({"Date": trading_index}).sort_values("Date")
+    left["Date"] = left["Date"].astype("datetime64[ns]")
+
     right = releases[
         [
             "Reference Month",
@@ -420,6 +437,8 @@ def build_daily_unemployment_state(
             "Release Date Source",
         ]
     ].sort_values("Release Date")
+
+    right["Release Date"] = right["Release Date"].astype("datetime64[ns]")
 
     mapped = pd.merge_asof(
         left,
