@@ -92,6 +92,35 @@ HISTORY_FILE = (
 WRITE_DELAY_SECONDS = 0.35
 HISTORY_REPAIR_DAYS = 45
 
+
+def env_bool(
+    name,
+    default=False,
+):
+    raw = os.getenv(
+        name
+    )
+
+    if raw is None:
+        return default
+
+    return (
+        raw.strip().lower()
+        in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }
+    )
+
+
+FULL_REBUILD = env_bool(
+    "FULL_REBUILD",
+    False,
+)
+
 NYSE = mcal.get_calendar(
     "NYSE"
 )
@@ -1026,17 +1055,35 @@ def sync_monthly_performance():
         load_monthly_results()
     )
 
-    recent = (
-        monthly
-        .tail(2)
-        .copy()
-    )
+    if FULL_REBUILD:
+        rows_to_sync = (
+            monthly.copy()
+        )
 
+        print(
+            "Full rebuild mode enabled."
+        )
+        print(
+            "Checking complete monthly history."
+        )
+
+    else:
+        rows_to_sync = (
+            monthly
+            .tail(2)
+            .copy()
+        )
+
+        print(
+            "Checking recent two months only."
+        )
+
+    print()
     print(
         "Checking months:"
     )
 
-    for month in recent[
+    for month in rows_to_sync[
         "Month"
     ]:
         print(
@@ -1052,7 +1099,7 @@ def sync_monthly_performance():
     }
 
     for _, row in (
-        recent.iterrows()
+        rows_to_sync.iterrows()
     ):
         result = sync_one_month(
             row
@@ -1070,7 +1117,7 @@ def sync_monthly_performance():
     print(
         "Months checked :",
         len(
-            recent
+            rows_to_sync
         ),
     )
     print(
@@ -1093,10 +1140,17 @@ def sync_monthly_performance():
     )
 
     print()
-    print(
-        "✅ Recent Strategy 1 Monthly "
-        "Performance synced to Notion"
-    )
+
+    if FULL_REBUILD:
+        print(
+            "✅ Complete Strategy 1 Monthly "
+            "Performance rebuilt in Notion"
+        )
+    else:
+        print(
+            "✅ Recent Strategy 1 Monthly "
+            "Performance synced to Notion"
+        )
 
 
 # ============================================================
@@ -1278,7 +1332,17 @@ def sync_annual_table(
             needs_full_sync = True
             break
 
-    if needs_full_sync:
+    if FULL_REBUILD:
+        rows = annual.copy()
+
+        print(
+            "Full rebuild mode enabled."
+        )
+        print(
+            "Checking complete annual history."
+        )
+
+    elif needs_full_sync:
         rows = annual.copy()
 
         print(
@@ -1897,7 +1961,22 @@ def sync_position_history():
             missing_old = True
             break
 
-    if (
+    if FULL_REBUILD:
+        rows = history.copy()
+        full_sync = True
+
+        print(
+            "Full rebuild mode enabled."
+        )
+        print(
+            "Checking complete Position History."
+        )
+        print(
+            "Old rows not present in the new "
+            "backtest will be archived."
+        )
+
+    elif (
         not existing
         or
         missing_old
@@ -2047,45 +2126,66 @@ def sync_position_history():
             WRITE_DELAY_SECONDS
         )
 
-    if not full_sync:
-        for key, page in (
+    # --------------------------------------------------------
+    # Archive stale rows.
+    #
+    # FULL_REBUILD:
+    #   compare against the COMPLETE new history and archive
+    #   every old Notion row that no longer exists.
+    #
+    # Normal daily mode:
+    #   only repair/archive rows inside the recent repair window.
+    # --------------------------------------------------------
+
+    if FULL_REBUILD:
+        archive_candidates = list(
             existing.items()
-        ):
-            signal_date = (
+        )
+
+    elif not full_sync:
+        archive_candidates = [
+            (key, page)
+            for key, page
+            in existing.items()
+            if (
                 pd.Timestamp(
                     key[0]
-                )
-                .normalize()
+                ).normalize()
+                >= cutoff
             )
+        ]
 
-            if signal_date < cutoff:
-                continue
+    else:
+        archive_candidates = []
 
-            if key in current_keys:
-                continue
+    for key, page in (
+        archive_candidates
+    ):
+        if key in current_keys:
+            continue
 
-            notion.request(
-                "PATCH",
-                f"pages/{page['id']}",
-                {
-                    "archived": True
-                },
-            )
+        notion.request(
+            "PATCH",
+            f"pages/{page['id']}",
+            {
+                "archived": True
+            },
+        )
 
-            counts[
-                "archived"
-            ] += 1
+        counts[
+            "archived"
+        ] += 1
 
-            print(
-                f"🗑️ "
-                f"{key[0]} → "
-                f"{key[1]} "
-                f"archived"
-            )
+        print(
+            f"🗑️ "
+            f"{key[0]} → "
+            f"{key[1]} "
+            f"archived"
+        )
 
-            time.sleep(
-                WRITE_DELAY_SECONDS
-            )
+        time.sleep(
+            WRITE_DELAY_SECONDS
+        )
 
     print()
     print(
@@ -2131,6 +2231,13 @@ def sync_rebalance_notification():
         "NOTION REBALANCE NOTIFICATION"
     )
     print("=" * 70)
+
+    if FULL_REBUILD:
+        print(
+            "⏭️ Full rebuild mode — "
+            "notification skipped"
+        )
+        return
 
     status = load_status()
 
@@ -2219,6 +2326,15 @@ def sync_strategy1():
     print(
         "Syncing Strategy 1 "
         "to Notion..."
+    )
+
+    print(
+        "Sync mode       :",
+        (
+            "FULL REBUILD"
+            if FULL_REBUILD
+            else "NORMAL"
+        ),
     )
 
     sync_current_status()

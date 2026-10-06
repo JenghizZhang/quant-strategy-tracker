@@ -1,7 +1,6 @@
 from pathlib import Path
 import json
 
-import numpy as np
 import pandas as pd
 
 from market_data import (
@@ -11,38 +10,67 @@ from market_data import (
 
 
 # ============================================================
-# Strategy 1 — 双轨趋势
+# Strategy 1 — 双轨趋势（交叉事件驱动）
 #
-# Signal at today's CLOSE:
+# State:
+#   1 = QQQ
+#   2 = SPY
+#   3 = AGG
 #
-# 1. NDX Close > NDX MA30
-#       -> QQQ
+# Entry / exit rules (signal at CLOSE):
 #
-# 2. NDX Close <= NDX MA30
-#    AND SPX MA50 > SPX MA200
-#       -> SPY
+# QQQ entry:
+#   NDX Close crosses ABOVE NDX MA30
 #
-# 3. Otherwise
-#       -> AGG
+# QQQ exit:
+#   NDX Close crosses BELOW / to-or-below NDX MA30
+#
+# SPY entry:
+#   SPX MA50 crosses ABOVE SPX MA200
+#   AND Rule 1 is not satisfied on that day
+#   (NDX Close <= NDX MA30)
+#
+# SPY exit:
+#   SPX MA50 crosses BELOW / to-or-below SPX MA200
+#
+# State transition:
+#   AGG -> QQQ : QQQ entry event
+#   AGG -> SPY : SPY entry event and Rule 1 not satisfied
+#   QQQ -> AGG : QQQ exit event
+#   SPY -> AGG : SPY exit event
+#
+# Direct QQQ <-> SPY is allowed ONLY when, on the SAME signal day:
+#   QQQ -> SPY:
+#       QQQ exit event + SPY entry event
+#   SPY -> QQQ:
+#       SPY exit event + QQQ entry event
+#
+# If the other condition was already true before today but did not
+# just trigger an entry cross today, direct switching is NOT allowed.
 #
 # Execution:
-#       Next trading day's OPEN
+#   Signal at today's CLOSE
+#   -> execute at NEXT trading day's OPEN
 #
 # Transaction cost:
-#       0
+#   0
 #
-# Backtest:
-#       From first trading day of 2016
+# Backtest reporting:
+#   From first trading day of 2016
 #
-# Latest market data priority:
-#       Daily
-#       -> 5m regular-session fallback
-#       -> 1m regular-session fallback
-#       -> Fail safely
+# Warm-up/state construction:
+#   Starts from 2010 historical data so that the state on
+#   2016-01-01 is established by several years of prior cross events.
+#
+# Latest market data priority is handled in market_data.py:
+#   Daily
+#   -> 5m regular-session fallback
+#   -> 1m regular-session fallback
+#   -> fail safely
 # ============================================================
 
 
-DOWNLOAD_START = "2014-01-01"
+DOWNLOAD_START = "2010-01-01"
 BACKTEST_START = pd.Timestamp("2016-01-01")
 
 NDX = "^NDX"
@@ -54,16 +82,21 @@ ASSETS = [
     "AGG",
 ]
 
+DEFENSIVE_ASSET = "AGG"
 OUTPUT_DIR = Path("output")
 
 
 # ============================================================
-# SIGNALS
+# INDICATORS + CROSS EVENTS
 # ============================================================
 
 def build_signals(ndx, spx):
     """
-    Build Strategy 1 signals from daily closing data.
+    Build indicator levels and one-day cross events.
+
+    Important:
+        This function does NOT decide the portfolio holding.
+        Portfolio decisions are made later by the state machine.
     """
 
     signals = pd.concat(
@@ -104,51 +137,13 @@ def build_signals(ndx, spx):
 
     signals = signals.dropna().copy()
 
-    condition_qqq = (
-        signals["NDX Close"]
-        > signals["NDX MA30"]
-    )
-
-    condition_spy = (
-        (~condition_qqq)
-        & (
-            signals["SPX MA50"]
-            > signals["SPX MA200"]
-        )
-    )
-
-    signals["Signal"] = np.select(
-        [
-            condition_qqq,
-            condition_spy,
-        ],
-        [
-            "QQQ",
-            "SPY",
-        ],
-        default="AGG",
-    )
-
-    signals["Reason"] = np.select(
-        [
-            condition_qqq,
-            condition_spy,
-        ],
-        [
-            "NDX > MA30 → QQQ",
-            (
-                "NDX <= MA30 and "
-                "SPX MA50 > MA200 → SPY"
-            ),
-        ],
-        default=(
-            "NDX <= MA30 and "
-            "SPX MA50 <= MA200 → AGG"
-        ),
-    )
+    # --------------------------------------------------------
+    # Current level conditions
+    # --------------------------------------------------------
 
     signals["NDX > MA30"] = (
-        condition_qqq
+        signals["NDX Close"]
+        > signals["NDX MA30"]
     )
 
     signals["SPX MA50 > MA200"] = (
@@ -156,7 +151,360 @@ def build_signals(ndx, spx):
         > signals["SPX MA200"]
     )
 
+    # --------------------------------------------------------
+    # Cross events
+    #
+    # We intentionally do NOT count the first valid MA row as
+    # a cross because there is no previous comparable row.
+    # --------------------------------------------------------
+
+    previous_ndx_above = (
+        signals["NDX > MA30"]
+        .shift(1)
+    )
+
+    previous_spx_above = (
+        signals["SPX MA50 > MA200"]
+        .shift(1)
+    )
+
+    signals["NDX Cross Up"] = (
+        signals["NDX > MA30"]
+        & previous_ndx_above.eq(False)
+    )
+
+    signals["NDX Cross Down"] = (
+        (~signals["NDX > MA30"])
+        & previous_ndx_above.eq(True)
+    )
+
+    signals["SPX Cross Up"] = (
+        signals["SPX MA50 > MA200"]
+        & previous_spx_above.eq(False)
+    )
+
+    signals["SPX Cross Down"] = (
+        (~signals["SPX MA50 > MA200"])
+        & previous_spx_above.eq(True)
+    )
+
     return signals
+
+
+# ============================================================
+# EVENT-DRIVEN STATE MACHINE
+# ============================================================
+
+def apply_state_machine(
+    signals,
+    initial_holding=DEFENSIVE_ASSET,
+):
+    """
+    Convert cross events into portfolio decisions.
+
+    'Current Holding' means the asset held at today's close.
+    'Signal' means the target to execute at next trading day's open.
+
+    Direct QQQ <-> SPY switching is only allowed when the current
+    holding exits AND the other holding triggers a fresh entry on
+    the exact same signal day.
+    """
+
+    result = signals.copy()
+
+    current_holding = initial_holding
+
+    current_holdings = []
+    next_holdings = []
+    reasons = []
+
+    for _, row in result.iterrows():
+        holding_at_close = current_holding
+
+        ndx_above = bool(
+            row["NDX > MA30"]
+        )
+
+        ndx_cross_up = bool(
+            row["NDX Cross Up"]
+        )
+
+        ndx_cross_down = bool(
+            row["NDX Cross Down"]
+        )
+
+        spx_cross_up = bool(
+            row["SPX Cross Up"]
+        )
+
+        spx_cross_down = bool(
+            row["SPX Cross Down"]
+        )
+
+        next_holding = holding_at_close
+
+        # ====================================================
+        # CURRENTLY QQQ
+        # ====================================================
+
+        if holding_at_close == "QQQ":
+
+            if ndx_cross_down:
+
+                # QQQ exits today. SPY may replace it directly
+                # only if SPY also produces a fresh entry today.
+                if spx_cross_up:
+                    next_holding = "SPY"
+                    reason = (
+                        "NDX crossed below MA30 and "
+                        "SPX MA50 crossed above MA200 "
+                        "on the same day → QQQ → SPY"
+                    )
+
+                else:
+                    next_holding = DEFENSIVE_ASSET
+                    reason = (
+                        "NDX crossed below MA30 "
+                        f"→ QQQ exit → {DEFENSIVE_ASSET}"
+                    )
+
+            else:
+                next_holding = "QQQ"
+                reason = (
+                    "Hold QQQ — no NDX down-cross below MA30"
+                )
+
+        # ====================================================
+        # CURRENTLY SPY
+        # ====================================================
+
+        elif holding_at_close == "SPY":
+
+            if spx_cross_down:
+
+                # SPY exits today. QQQ may replace it directly
+                # only if QQQ also produces a fresh entry today.
+                if ndx_cross_up:
+                    next_holding = "QQQ"
+                    reason = (
+                        "SPX MA50 crossed below MA200 and "
+                        "NDX crossed above MA30 "
+                        "on the same day → SPY → QQQ"
+                    )
+
+                else:
+                    next_holding = DEFENSIVE_ASSET
+                    reason = (
+                        "SPX MA50 crossed below MA200 "
+                        f"→ SPY exit → {DEFENSIVE_ASSET}"
+                    )
+
+            else:
+                next_holding = "SPY"
+                reason = (
+                    "Hold SPY — no SPX MA50/MA200 down-cross"
+                )
+
+        # ====================================================
+        # CURRENTLY DEFENSIVE ASSET (AGG)
+        # ====================================================
+
+        elif holding_at_close == DEFENSIVE_ASSET:
+
+            # Rule 1 has priority.
+            if ndx_cross_up:
+                next_holding = "QQQ"
+                reason = (
+                    "NDX crossed above MA30 → QQQ entry"
+                )
+
+            # SPY entry requires a fresh golden cross AND
+            # Rule 1 not satisfied on this day.
+            elif (
+                spx_cross_up
+                and not ndx_above
+            ):
+                next_holding = "SPY"
+                reason = (
+                    "SPX MA50 crossed above MA200 and "
+                    "NDX <= MA30 → SPY entry"
+                )
+
+            else:
+                next_holding = DEFENSIVE_ASSET
+
+                if (
+                    spx_cross_up
+                    and ndx_above
+                ):
+                    reason = (
+                        "SPX MA50 crossed above MA200, but "
+                        "Rule 1 is already satisfied "
+                        f"(NDX > MA30) → stay {DEFENSIVE_ASSET}"
+                    )
+                else:
+                    reason = (
+                        "No new valid entry cross "
+                        f"→ stay {DEFENSIVE_ASSET}"
+                    )
+
+        else:
+            raise RuntimeError(
+                f"Unknown holding state: {holding_at_close}"
+            )
+
+        current_holdings.append(
+            holding_at_close
+        )
+
+        next_holdings.append(
+            next_holding
+        )
+
+        reasons.append(
+            reason
+        )
+
+        # The decision made at today's close becomes the holding
+        # after the next trading day's open. Therefore it is the
+        # current state when we evaluate the next close.
+        current_holding = next_holding
+
+    result["Current Holding"] = (
+        current_holdings
+    )
+
+    result["Signal"] = (
+        next_holdings
+    )
+
+    result["Reason"] = (
+        reasons
+    )
+
+    return result
+
+
+# ============================================================
+# STATE-MACHINE VALIDATION
+# ============================================================
+
+def validate_state_machine(
+    decisions,
+    position_history,
+):
+    """
+    Hard validation for the user's transition rule.
+
+    QQQ -> SPY is legal only if:
+        NDX Cross Down == True
+        SPX Cross Up   == True
+
+    SPY -> QQQ is legal only if:
+        SPX Cross Down == True
+        NDX Cross Up   == True
+    """
+
+    qqq_to_spy = 0
+    spy_to_qqq = 0
+
+    for _, change in position_history.iterrows():
+        old_holding = change["From"]
+        new_holding = change["To"]
+
+        # Initial CASH allocation is not a state-to-state switch.
+        if old_holding == "CASH":
+            continue
+
+        signal_date = pd.Timestamp(
+            change["Signal Date"]
+        )
+
+        if signal_date not in decisions.index:
+            raise RuntimeError(
+                "Position History signal date is missing "
+                f"from decision table: {signal_date.date()}"
+            )
+
+        row = decisions.loc[
+            signal_date
+        ]
+
+        if (
+            old_holding == "QQQ"
+            and new_holding == "SPY"
+        ):
+            qqq_to_spy += 1
+
+            if not (
+                bool(row["NDX Cross Down"])
+                and bool(row["SPX Cross Up"])
+            ):
+                raise RuntimeError(
+                    "Illegal QQQ -> SPY switch on "
+                    f"{signal_date.date()}. "
+                    "Direct switching requires same-day "
+                    "QQQ exit + SPY entry."
+                )
+
+        elif (
+            old_holding == "SPY"
+            and new_holding == "QQQ"
+        ):
+            spy_to_qqq += 1
+
+            if not (
+                bool(row["SPX Cross Down"])
+                and bool(row["NDX Cross Up"])
+            ):
+                raise RuntimeError(
+                    "Illegal SPY -> QQQ switch on "
+                    f"{signal_date.date()}. "
+                    "Direct switching requires same-day "
+                    "SPY exit + QQQ entry."
+                )
+
+        elif (
+            old_holding == "QQQ"
+            and new_holding not in [
+                "QQQ",
+                DEFENSIVE_ASSET,
+            ]
+        ):
+            raise RuntimeError(
+                f"Illegal QQQ transition: "
+                f"{old_holding} -> {new_holding}"
+            )
+
+        elif (
+            old_holding == "SPY"
+            and new_holding not in [
+                "SPY",
+                DEFENSIVE_ASSET,
+            ]
+        ):
+            raise RuntimeError(
+                f"Illegal SPY transition: "
+                f"{old_holding} -> {new_holding}"
+            )
+
+        elif (
+            old_holding == DEFENSIVE_ASSET
+            and new_holding not in [
+                DEFENSIVE_ASSET,
+                "QQQ",
+                "SPY",
+            ]
+        ):
+            raise RuntimeError(
+                f"Illegal {DEFENSIVE_ASSET} transition: "
+                f"{old_holding} -> {new_holding}"
+            )
+
+    return {
+        "QQQ -> SPY": qqq_to_spy,
+        "SPY -> QQQ": spy_to_qqq,
+    }
 
 
 # ============================================================
@@ -170,14 +518,17 @@ def run_backtest(
     """
     Signal is generated at today's CLOSE.
 
-    The new position is entered at
-    NEXT trading day's OPEN.
+    The new position is entered at NEXT trading day's OPEN.
 
     Previous position receives:
         previous close -> next open
 
     New/current position receives:
         next open -> next close
+
+    State-machine decisions are calculated on the complete common
+    historical index BEFORE the 2016 reporting cutoff. This keeps
+    the 2016 starting state dependent on pre-2016 cross events.
     """
 
     common_index = (
@@ -195,20 +546,36 @@ def run_backtest(
         common_index.sort_values()
     )
 
-    signals = signals.loc[
-        common_index
-    ].copy()
+    if len(common_index) < 2:
+        raise RuntimeError(
+            "Not enough common trading dates "
+            "to run Strategy 1."
+        )
+
+    # --------------------------------------------------------
+    # Apply the event-driven state machine on the FULL warm-up
+    # history, not just from 2016 onward.
+    # --------------------------------------------------------
+
+    decisions = apply_state_machine(
+        signals.loc[
+            common_index
+        ].copy()
+    )
 
     execution = pd.DataFrame(
         index=common_index
     )
 
+    # Today's open executes yesterday close's decision.
     execution["Target"] = (
-        signals["Signal"].shift(1)
+        decisions["Signal"]
+        .shift(1)
     )
 
     execution["Reason"] = (
-        signals["Reason"].shift(1)
+        decisions["Reason"]
+        .shift(1)
     )
 
     execution["Signal Date"] = (
@@ -233,8 +600,35 @@ def run_backtest(
 
     if execution.empty:
         raise RuntimeError(
-            "No backtest dates "
-            "available after 2016."
+            "No backtest dates available after 2016."
+        )
+
+    # --------------------------------------------------------
+    # Internal consistency:
+    # The position executed at today's open must equal the state
+    # that the state machine considers current at today's close.
+    # --------------------------------------------------------
+
+    expected_current = (
+        decisions.loc[
+            execution.index,
+            "Current Holding",
+        ]
+    )
+
+    mismatches = (
+        execution["Target"]
+        != expected_current
+    )
+
+    if mismatches.any():
+        bad_date = mismatches[
+            mismatches
+        ].index[0]
+
+        raise RuntimeError(
+            "State-machine/execution mismatch on "
+            f"{bad_date.date()}."
         )
 
     equity = 1.0
@@ -249,22 +643,19 @@ def run_backtest(
 
         target = row["Target"]
 
-        signal_date = row[
-            "Signal Date"
-        ]
+        signal_date = pd.Timestamp(
+            row["Signal Date"]
+        )
 
-        reason = row[
-            "Reason"
-        ]
+        reason = row["Reason"]
 
         # ====================================================
-        # FIRST TRADING DAY
+        # FIRST TRADING DAY OF REPORTED BACKTEST
         # ====================================================
 
         if previous_date is None:
 
             old_holding = "CASH"
-
             holding = target
 
             open_price = (
@@ -291,9 +682,7 @@ def run_backtest(
             position_history.append(
                 {
                     "Change": (
-                        f"{old_holding}"
-                        f" → "
-                        f"{holding}"
+                        f"{old_holding} → {holding}"
                     ),
                     "Signal Date": (
                         signal_date
@@ -345,25 +734,18 @@ def run_backtest(
             )
 
             # ------------------------------------------------
-            # Switch at today's open if target changed.
+            # Switch at today's open if yesterday's signal changed.
             # ------------------------------------------------
 
             if target != holding:
 
-                old_holding = (
-                    holding
-                )
-
-                holding = (
-                    target
-                )
+                old_holding = holding
+                holding = target
 
                 position_history.append(
                     {
                         "Change": (
-                            f"{old_holding}"
-                            f" → "
-                            f"{holding}"
+                            f"{old_holding} → {holding}"
                         ),
                         "Signal Date": (
                             signal_date
@@ -408,24 +790,58 @@ def run_backtest(
                 / current_open
             )
 
+        decision_today = decisions.loc[
+            date
+        ]
+
         daily_rows.append(
             {
                 "Date": date,
                 "Equity": equity,
                 "Holding": holding,
                 "Target": target,
-                "Signal Date": (
-                    signal_date
+                "Signal Date": signal_date,
+                "Signal Reason": reason,
+                "Today's Signal": (
+                    decision_today["Signal"]
                 ),
-                "Signal Reason": (
-                    reason
+                "Today's Reason": (
+                    decision_today["Reason"]
+                ),
+                "NDX Close": (
+                    decision_today["NDX Close"]
+                ),
+                "NDX MA30": (
+                    decision_today["NDX MA30"]
+                ),
+                "NDX > MA30": (
+                    decision_today["NDX > MA30"]
+                ),
+                "NDX Cross Up": (
+                    decision_today["NDX Cross Up"]
+                ),
+                "NDX Cross Down": (
+                    decision_today["NDX Cross Down"]
+                ),
+                "SPX MA50": (
+                    decision_today["SPX MA50"]
+                ),
+                "SPX MA200": (
+                    decision_today["SPX MA200"]
+                ),
+                "SPX MA50 > MA200": (
+                    decision_today["SPX MA50 > MA200"]
+                ),
+                "SPX Cross Up": (
+                    decision_today["SPX Cross Up"]
+                ),
+                "SPX Cross Down": (
+                    decision_today["SPX Cross Down"]
                 ),
             }
         )
 
-        previous_date = (
-            date
-        )
+        previous_date = date
 
     daily = pd.DataFrame(
         daily_rows
@@ -437,9 +853,16 @@ def run_backtest(
         position_history
     )
 
+    validation = validate_state_machine(
+        decisions,
+        history,
+    )
+
     return (
         daily,
         history,
+        decisions,
+        validation,
     )
 
 
@@ -452,13 +875,11 @@ def buy_and_hold_equity(
     dates,
 ):
     """
-    Benchmark begins at the OPEN of
-    the first Strategy 1 backtest day.
+    Benchmark begins at the OPEN of the first
+    Strategy 1 reported backtest day.
     """
 
-    first_date = (
-        dates[0]
-    )
+    first_date = dates[0]
 
     initial_open = (
         price_df.at[
@@ -510,15 +931,14 @@ def calculate_period_returns(
     else:
 
         raise ValueError(
-            f"Unknown period: "
-            f"{period}"
+            f"Unknown period: {period}"
         )
 
     returns = (
         end_values.pct_change()
     )
 
-    # First period starts from equity = 1
+    # First reporting period starts from equity = 1.
     returns.iloc[0] = (
         end_values.iloc[0]
         - 1.0
@@ -544,12 +964,9 @@ def calculate_metrics(
         < latest_year
     ]
 
-    if (
-        len(
-            prior_year_values
-        )
-        > 0
-    ):
+    if len(
+        prior_year_values
+    ) > 0:
 
         ytd_base = (
             prior_year_values
@@ -623,7 +1040,6 @@ def calculate_metrics(
 def percent(
     value,
 ):
-
     return (
         f"{value * 100:.2f}%"
     )
@@ -636,11 +1052,9 @@ def percent(
 def main():
 
     print("=" * 70)
-
     print(
-        "Strategy 1 — 双轨趋势"
+        "Strategy 1 — 双轨趋势（交叉事件驱动）"
     )
-
     print("=" * 70)
 
     # ========================================================
@@ -656,13 +1070,10 @@ def main():
     )
 
     print()
-
     print(
-        "Latest completed "
-        "market session:",
+        "Latest completed market session:",
         target_date.date(),
     )
-
     print()
 
     # ========================================================
@@ -698,16 +1109,11 @@ def main():
             )
         )
 
-        prices[
-            ticker
-        ] = df
-
-        price_sources[
-            ticker
-        ] = source
+        prices[ticker] = df
+        price_sources[ticker] = source
 
     # ========================================================
-    # SIGNALS
+    # INDICATORS + CROSS EVENTS
     # ========================================================
 
     signals = build_signals(
@@ -716,12 +1122,14 @@ def main():
     )
 
     # ========================================================
-    # BACKTEST
+    # BACKTEST + STATE MACHINE
     # ========================================================
 
     (
         strategy_daily,
         position_history,
+        decisions,
+        validation,
     ) = run_backtest(
         signals,
         prices,
@@ -735,25 +1143,17 @@ def main():
     # FRESHNESS CHECK
     # ========================================================
 
-    if (
-        dates[-1]
-        != target_date
-    ):
+    if dates[-1] != target_date:
 
         raise RuntimeError(
-            "Backtest did not reach "
-            "the latest completed "
+            "Backtest did not reach the latest completed "
             "market session. "
-            f"Expected "
-            f"{target_date.date()}, "
-            f"got "
-            f"{dates[-1].date()}."
+            f"Expected {target_date.date()}, "
+            f"got {dates[-1].date()}."
         )
 
     strategy_equity = (
-        strategy_daily[
-            "Equity"
-        ]
+        strategy_daily["Equity"]
     )
 
     # ========================================================
@@ -786,14 +1186,12 @@ def main():
                     "month",
                 )
             ),
-
             "QQQ": (
                 calculate_period_returns(
                     qqq_equity,
                     "month",
                 )
             ),
-
             "SPY": (
                 calculate_period_returns(
                     spy_equity,
@@ -809,9 +1207,7 @@ def main():
         )
     )
 
-    monthly.index.name = (
-        "Month"
-    )
+    monthly.index.name = "Month"
 
     # ========================================================
     # ANNUAL PERFORMANCE
@@ -825,14 +1221,12 @@ def main():
                     "year",
                 )
             ),
-
             "QQQ": (
                 calculate_period_returns(
                     qqq_equity,
                     "year",
                 )
             ),
-
             "SPY": (
                 calculate_period_returns(
                     spy_equity,
@@ -842,28 +1236,23 @@ def main():
         }
     )
 
-    annual.index.name = (
-        "Year"
-    )
+    annual.index.name = "Year"
 
     # ========================================================
     # SUMMARY
     # ========================================================
 
     summary = {
-
         "Strategy 1": (
             calculate_metrics(
                 strategy_equity
             )
         ),
-
         "QQQ": (
             calculate_metrics(
                 qqq_equity
             )
         ),
-
         "SPY": (
             calculate_metrics(
                 spy_equity
@@ -875,22 +1264,21 @@ def main():
     # CURRENT STATUS
     # ========================================================
 
-    latest_date = (
-        dates[-1]
-    )
+    latest_date = dates[-1]
 
     current_holding = (
         strategy_daily
-        .iloc[-1][
-            "Holding"
+        .iloc[-1]["Holding"]
+    )
+
+    latest_decision = (
+        decisions.loc[
+            latest_date
         ]
     )
 
     today_signal = (
-        signals.at[
-            latest_date,
-            "Signal",
-        ]
+        latest_decision["Signal"]
     )
 
     next_holding = (
@@ -903,90 +1291,82 @@ def main():
     )
 
     current_status = {
-
         "Data Date": str(
             latest_date.date()
         ),
-
         "Signal Date": str(
             latest_date.date()
         ),
-
         "Current Holding": (
             current_holding
         ),
-
         "Today's Signal": (
             today_signal
         ),
-
         "Next Holding": (
             next_holding
         ),
-
         "Pending Change": (
             pending_change
         ),
-
         "NDX Close": float(
-            signals.at[
-                latest_date,
-                "NDX Close",
+            latest_decision[
+                "NDX Close"
             ]
         ),
-
         "NDX MA30": float(
-            signals.at[
-                latest_date,
-                "NDX MA30",
+            latest_decision[
+                "NDX MA30"
             ]
         ),
-
         "NDX > MA30": bool(
-            signals.at[
-                latest_date,
-                "NDX > MA30",
+            latest_decision[
+                "NDX > MA30"
             ]
         ),
-
+        "NDX Cross Up": bool(
+            latest_decision[
+                "NDX Cross Up"
+            ]
+        ),
+        "NDX Cross Down": bool(
+            latest_decision[
+                "NDX Cross Down"
+            ]
+        ),
         "SPX MA50": float(
-            signals.at[
-                latest_date,
-                "SPX MA50",
+            latest_decision[
+                "SPX MA50"
             ]
         ),
-
         "SPX MA200": float(
-            signals.at[
-                latest_date,
-                "SPX MA200",
+            latest_decision[
+                "SPX MA200"
             ]
         ),
-
         "SPX MA50 > MA200": bool(
-            signals.at[
-                latest_date,
-                "SPX MA50 > MA200",
+            latest_decision[
+                "SPX MA50 > MA200"
             ]
         ),
-
+        "SPX Cross Up": bool(
+            latest_decision[
+                "SPX Cross Up"
+            ]
+        ),
+        "SPX Cross Down": bool(
+            latest_decision[
+                "SPX Cross Down"
+            ]
+        ),
         "Reason": (
-            signals.at[
-                latest_date,
-                "Reason",
+            latest_decision[
+                "Reason"
             ]
         ),
-
         "Data Sources": {
-
-            "NDX": (
-                ndx_source
-            ),
-
-            "SPX": (
-                spx_source
-            ),
-
+            "NDX": ndx_source,
+            "SPX": spx_source,
             **price_sources,
         },
     }
@@ -1030,10 +1410,7 @@ def main():
 
         json.dump(
             {
-                "summary": (
-                    summary
-                ),
-
+                "summary": summary,
                 "current_status": (
                     current_status
                 ),
@@ -1048,11 +1425,7 @@ def main():
     # ========================================================
 
     print()
-
-    print(
-        "BACKTEST PERIOD"
-    )
-
+    print("BACKTEST PERIOD")
     print(
         f"{dates[0].date()}"
         f" → "
@@ -1060,30 +1433,24 @@ def main():
     )
 
     print()
-
     print("=" * 70)
     print("DATA SOURCES")
     print("=" * 70)
 
     print(
-        f"NDX : "
-        f"{ndx_source}"
+        f"NDX : {ndx_source}"
     )
-
     print(
-        f"SPX : "
-        f"{spx_source}"
+        f"SPX : {spx_source}"
     )
 
     for ticker in ASSETS:
-
         print(
             f"{ticker:<3} : "
             f"{price_sources[ticker]}"
         )
 
     print()
-
     print("=" * 70)
     print("CURRENT STATUS")
     print("=" * 70)
@@ -1092,22 +1459,18 @@ def main():
         "Data Date       :",
         latest_date.date(),
     )
-
     print(
         "Current Holding :",
         current_holding,
     )
-
     print(
         "Today's Signal  :",
         today_signal,
     )
-
     print(
         "Next Holding    :",
         next_holding,
     )
-
     print(
         "Pending Change  :",
         (
@@ -1118,45 +1481,62 @@ def main():
     )
 
     print()
-
     print(
         f"NDX Close       : "
         f"{current_status['NDX Close']:.2f}"
     )
-
     print(
         f"NDX MA30        : "
         f"{current_status['NDX MA30']:.2f}"
     )
-
     print(
         "NDX > MA30      :",
         current_status[
             "NDX > MA30"
         ],
     )
+    print(
+        "NDX Cross Up    :",
+        current_status[
+            "NDX Cross Up"
+        ],
+    )
+    print(
+        "NDX Cross Down  :",
+        current_status[
+            "NDX Cross Down"
+        ],
+    )
 
     print()
-
     print(
         f"SPX MA50        : "
         f"{current_status['SPX MA50']:.2f}"
     )
-
     print(
         f"SPX MA200       : "
         f"{current_status['SPX MA200']:.2f}"
     )
-
     print(
         "MA50 > MA200    :",
         current_status[
             "SPX MA50 > MA200"
         ],
     )
+    print(
+        "SPX Cross Up    :",
+        current_status[
+            "SPX Cross Up"
+        ],
+    )
+    print(
+        "SPX Cross Down  :",
+        current_status[
+            "SPX Cross Down"
+        ],
+    )
 
     print()
-
     print(
         "Reason           :",
         current_status[
@@ -1165,21 +1545,37 @@ def main():
     )
 
     print()
+    print("=" * 70)
+    print("STATE MACHINE VALIDATION")
+    print("=" * 70)
 
+    print(
+        "Direct QQQ -> SPY switches :",
+        validation[
+            "QQQ -> SPY"
+        ],
+    )
+    print(
+        "Direct SPY -> QQQ switches :",
+        validation[
+            "SPY -> QQQ"
+        ],
+    )
+    print(
+        "✅ Every direct QQQ/SPY switch "
+        "passed same-day exit + entry validation"
+    )
+
+    print()
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
 
-    for (
-        name,
-        metrics,
-    ) in summary.items():
-
+    for name, metrics in (
+        summary.items()
+    ):
         print()
-        print(
-            name
-        )
-
+        print(name)
         print(
             "  YTD Return    :",
             percent(
@@ -1188,7 +1584,6 @@ def main():
                 ]
             ),
         )
-
         print(
             "  Since 2016    :",
             percent(
@@ -1197,7 +1592,6 @@ def main():
                 ]
             ),
         )
-
         print(
             "  CAGR          :",
             percent(
@@ -1206,7 +1600,6 @@ def main():
                 ]
             ),
         )
-
         print(
             "  Max Drawdown  :",
             percent(
@@ -1217,7 +1610,6 @@ def main():
         )
 
     print()
-
     print("=" * 70)
     print("LATEST 12 MONTHS")
     print("=" * 70)
@@ -1235,7 +1627,6 @@ def main():
     )
 
     print()
-
     print("=" * 70)
     print("ANNUAL RETURNS")
     print("=" * 70)
@@ -1251,16 +1642,14 @@ def main():
     )
 
     print()
-
     print(
         f"Position changes: "
         f"{len(position_history)}"
     )
 
     print()
-
     print(
-        "✅ Strategy 1 "
+        "✅ Strategy 1 event-driven "
         "backtest completed"
     )
 
