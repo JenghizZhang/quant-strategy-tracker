@@ -30,20 +30,30 @@ from market_data import (
 #   AND Rule 1 is not satisfied on that day
 #   (NDX Close <= NDX MA30)
 #
+# SPY valid / hold condition:
+#   NDX Close <= NDX MA30
+#   AND SPX MA50 > SPX MA200
+#
+# SPY entry:
+#   SPX MA50 crosses ABOVE SPX MA200
+#   AND NDX Close <= NDX MA30 on that same signal day
+#
 # SPY exit:
-#   SPX MA50 crosses BELOW / to-or-below SPX MA200
+#   SPY exits whenever its AND condition becomes false:
+#       NDX Close > NDX MA30
+#       OR SPX MA50 <= SPX MA200
 #
 # State transition:
-#   AGG -> QQQ : QQQ entry event
-#   AGG -> SPY : SPY entry event and Rule 1 not satisfied
-#   QQQ -> AGG : QQQ exit event
-#   SPY -> AGG : SPY exit event
+#   AGG -> QQQ : QQQ fresh entry event
+#   AGG -> SPY : SPY fresh entry event
+#   QQQ -> AGG : QQQ exit event, unless same-day SPY fresh entry
+#   SPY -> AGG : SPY condition becomes invalid, unless same-day QQQ fresh entry
 #
 # Direct QQQ <-> SPY is allowed ONLY when, on the SAME signal day:
 #   QQQ -> SPY:
-#       QQQ exit event + SPY entry event
+#       QQQ fresh exit + SPY fresh entry
 #   SPY -> QQQ:
-#       SPY exit event + QQQ entry event
+#       SPY becomes invalid + QQQ fresh entry
 #
 # If the other condition was already true before today but did not
 # just trigger an entry cross today, direct switching is NOT allowed.
@@ -204,18 +214,35 @@ def apply_state_machine(
     initial_holding=INITIAL_HOLDING,
 ):
     """
-    Convert cross events into portfolio decisions.
+    Convert daily close events into next-open portfolio decisions.
 
-    'Current Holding' means the asset held at today's close.
-    'Signal' means the target to execute at next trading day's open.
+    Definitions:
+        QQQ entry:
+            NDX fresh cross from <= MA30 to > MA30.
 
-    Direct QQQ <-> SPY switching is only allowed when the current
-    holding exits AND the other holding triggers a fresh entry on
-    the exact same signal day.
+        QQQ exit:
+            NDX fresh cross from > MA30 to <= MA30.
 
-    The earliest state is CASH. CASH waits for the first valid entry
-    event and is never used as the normal defensive state; exits from
-    QQQ/SPY go to AGG.
+        SPY valid / hold condition:
+            NDX <= MA30 AND SPX MA50 > SPX MA200.
+
+        SPY fresh entry:
+            SPX MA50 fresh crosses above MA200 while NDX <= MA30.
+
+        SPY exit:
+            The SPY AND condition becomes false for any reason:
+            NDX > MA30 OR SPX MA50 <= SPX MA200.
+
+    Direct switching:
+        QQQ -> SPY only when QQQ exits and SPY has a fresh entry
+        on the same signal day.
+
+        SPY -> QQQ only when SPY becomes invalid and QQQ has a
+        fresh entry on the same signal day.
+
+    CASH is only the seed state. After the strategy first leaves CASH,
+    normal defensive exits go to AGG and the state machine never
+    intentionally returns to CASH.
     """
 
     result = signals.copy()
@@ -233,6 +260,10 @@ def apply_state_machine(
             row["NDX > MA30"]
         )
 
+        spx_above = bool(
+            row["SPX MA50 > MA200"]
+        )
+
         ndx_cross_up = bool(
             row["NDX Cross Up"]
         )
@@ -245,8 +276,17 @@ def apply_state_machine(
             row["SPX Cross Up"]
         )
 
-        spx_cross_down = bool(
-            row["SPX Cross Down"]
+        # SPY is an AND condition.
+        spy_ok = (
+            (not ndx_above)
+            and spx_above
+        )
+
+        # A new SPY position can be opened only on a fresh SPX
+        # golden-cross day while QQQ / Rule 1 is not satisfied.
+        spy_entry_event = (
+            spx_cross_up
+            and not ndx_above
         )
 
         next_holding = holding_at_close
@@ -260,26 +300,28 @@ def apply_state_machine(
             if ndx_cross_down:
 
                 # QQQ exits today. SPY may replace it directly
-                # only if SPY also produces a fresh entry today.
-                if spx_cross_up:
+                # only if SPY also has a fresh valid entry today.
+                if spy_entry_event:
                     next_holding = "SPY"
                     reason = (
-                        "NDX crossed below MA30 and "
+                        "NDX crossed to/below MA30 and "
                         "SPX MA50 crossed above MA200 "
-                        "on the same day → QQQ → SPY"
+                        "on the same day while NDX <= MA30 "
+                        "→ QQQ → SPY"
                     )
 
                 else:
                     next_holding = DEFENSIVE_ASSET
                     reason = (
-                        "NDX crossed below MA30 "
+                        "NDX crossed to/below MA30 "
                         f"→ QQQ exit → {DEFENSIVE_ASSET}"
                     )
 
             else:
                 next_holding = "QQQ"
                 reason = (
-                    "Hold QQQ — no NDX down-cross below MA30"
+                    "Hold QQQ — NDX remains above MA30 "
+                    "with no fresh down-cross"
                 )
 
         # ====================================================
@@ -288,29 +330,52 @@ def apply_state_machine(
 
         elif holding_at_close == "SPY":
 
-            if spx_cross_down:
+            # SPY must continuously satisfy BOTH conditions:
+            #   NDX <= MA30
+            #   SPX MA50 > MA200
+            # If either becomes false, SPY exits.
+            if not spy_ok:
 
-                # SPY exits today. QQQ may replace it directly
-                # only if QQQ also produces a fresh entry today.
+                # If NDX itself fresh-crossed above MA30 today,
+                # SPY becomes invalid and QQQ gets a fresh entry
+                # on the same signal day, so direct SPY -> QQQ
+                # is legal.
                 if ndx_cross_up:
                     next_holding = "QQQ"
                     reason = (
-                        "SPX MA50 crossed below MA200 and "
-                        "NDX crossed above MA30 "
-                        "on the same day → SPY → QQQ"
+                        "SPY condition became invalid because "
+                        "NDX crossed above MA30, and QQQ received "
+                        "a fresh entry on the same day "
+                        "→ SPY → QQQ"
                     )
 
                 else:
                     next_holding = DEFENSIVE_ASSET
-                    reason = (
-                        "SPX MA50 crossed below MA200 "
-                        f"→ SPY exit → {DEFENSIVE_ASSET}"
-                    )
+
+                    if ndx_above:
+                        reason = (
+                            "SPY condition invalid: NDX > MA30 "
+                            f"→ SPY exit → {DEFENSIVE_ASSET}"
+                        )
+                    elif not spx_above:
+                        reason = (
+                            "SPY condition invalid: "
+                            "SPX MA50 <= MA200 "
+                            f"→ SPY exit → {DEFENSIVE_ASSET}"
+                        )
+                    else:
+                        # Defensive safety branch; logically spy_ok=False
+                        # must be explained by one of the conditions above.
+                        reason = (
+                            "SPY AND condition became invalid "
+                            f"→ SPY exit → {DEFENSIVE_ASSET}"
+                        )
 
             else:
                 next_holding = "SPY"
                 reason = (
-                    "Hold SPY — no SPX MA50/MA200 down-cross"
+                    "Hold SPY — NDX <= MA30 AND "
+                    "SPX MA50 > MA200"
                 )
 
         # ====================================================
@@ -319,19 +384,14 @@ def apply_state_machine(
 
         elif holding_at_close == INITIAL_HOLDING:
 
-            # CASH is only the seed state. It waits for a fresh, valid
-            # entry event. Once the strategy leaves CASH, exits go to AGG
-            # and the state machine never intentionally returns to CASH.
+            # Rule 1 has priority.
             if ndx_cross_up:
                 next_holding = "QQQ"
                 reason = (
                     "NDX crossed above MA30 → initial QQQ entry"
                 )
 
-            elif (
-                spx_cross_up
-                and not ndx_above
-            ):
+            elif spy_entry_event:
                 next_holding = "SPY"
                 reason = (
                     "SPX MA50 crossed above MA200 and "
@@ -357,12 +417,7 @@ def apply_state_machine(
                     "NDX crossed above MA30 → QQQ entry"
                 )
 
-            # SPY entry requires a fresh golden cross AND
-            # Rule 1 not satisfied on this day.
-            elif (
-                spx_cross_up
-                and not ndx_above
-            ):
+            elif spy_entry_event:
                 next_holding = "SPY"
                 reason = (
                     "SPX MA50 crossed above MA200 and "
@@ -372,14 +427,11 @@ def apply_state_machine(
             else:
                 next_holding = DEFENSIVE_ASSET
 
-                if (
-                    spx_cross_up
-                    and ndx_above
-                ):
+                if spx_cross_up and ndx_above:
                     reason = (
                         "SPX MA50 crossed above MA200, but "
-                        "Rule 1 is already satisfied "
-                        f"(NDX > MA30) → stay {DEFENSIVE_ASSET}"
+                        "NDX > MA30 so the SPY AND condition "
+                        f"is not valid → stay {DEFENSIVE_ASSET}"
                     )
                 else:
                     reason = (
@@ -404,9 +456,9 @@ def apply_state_machine(
             reason
         )
 
-        # The decision made at today's close becomes the holding
-        # after the next trading day's open. Therefore it is the
-        # current state when we evaluate the next close.
+        # Today's close decision becomes the position after the next
+        # trading day's open, and therefore the state evaluated at the
+        # next close.
         current_holding = next_holding
 
     result["Current Holding"] = (
@@ -433,15 +485,20 @@ def validate_state_machine(
     position_history,
 ):
     """
-    Hard validation for the user's transition rule.
+    Hard validation for Strategy 1 transitions.
 
-    QQQ -> SPY is legal only if:
+    QQQ -> SPY is legal only if the same signal day contains:
         NDX Cross Down == True
-        SPX Cross Up   == True
+        valid SPY fresh entry ==
+            SPX Cross Up == True AND NDX <= MA30
 
-    SPY -> QQQ is legal only if:
-        SPX Cross Down == True
-        NDX Cross Up   == True
+    SPY -> QQQ is legal only if the same signal day contains:
+        SPY condition invalid
+        NDX Cross Up == True
+
+    QQQ -> AGG requires a QQQ fresh exit.
+    SPY -> AGG requires the SPY AND condition to be invalid.
+    AGG -> QQQ / SPY requires a fresh valid entry event.
     """
 
     qqq_to_spy = 0
@@ -450,10 +507,6 @@ def validate_state_machine(
     for _, change in position_history.iterrows():
         old_holding = change["From"]
         new_holding = change["To"]
-
-        # Initial CASH allocation is not a state-to-state switch.
-        if old_holding == "CASH":
-            continue
 
         signal_date = pd.Timestamp(
             change["Signal Date"]
@@ -469,75 +522,156 @@ def validate_state_machine(
             signal_date
         ]
 
-        if (
-            old_holding == "QQQ"
-            and new_holding == "SPY"
-        ):
-            qqq_to_spy += 1
+        ndx_above = bool(
+            row["NDX > MA30"]
+        )
 
-            if not (
-                bool(row["NDX Cross Down"])
-                and bool(row["SPX Cross Up"])
-            ):
+        spx_above = bool(
+            row["SPX MA50 > MA200"]
+        )
+
+        ndx_cross_up = bool(
+            row["NDX Cross Up"]
+        )
+
+        ndx_cross_down = bool(
+            row["NDX Cross Down"]
+        )
+
+        spx_cross_up = bool(
+            row["SPX Cross Up"]
+        )
+
+        spy_ok = (
+            (not ndx_above)
+            and spx_above
+        )
+
+        spy_entry_event = (
+            spx_cross_up
+            and not ndx_above
+        )
+
+        # ----------------------------------------------------
+        # Initial CASH allocation
+        # ----------------------------------------------------
+
+        if old_holding == INITIAL_HOLDING:
+            if new_holding == "QQQ":
+                if not ndx_cross_up:
+                    raise RuntimeError(
+                        "Illegal CASH -> QQQ transition on "
+                        f"{signal_date.date()}: no fresh NDX up-cross."
+                    )
+
+            elif new_holding == "SPY":
+                if not spy_entry_event:
+                    raise RuntimeError(
+                        "Illegal CASH -> SPY transition on "
+                        f"{signal_date.date()}: no fresh valid SPY entry."
+                    )
+
+            elif new_holding != INITIAL_HOLDING:
                 raise RuntimeError(
-                    "Illegal QQQ -> SPY switch on "
-                    f"{signal_date.date()}. "
-                    "Direct switching requires same-day "
-                    "QQQ exit + SPY entry."
+                    f"Illegal CASH transition: CASH -> {new_holding}"
                 )
 
-        elif (
-            old_holding == "SPY"
-            and new_holding == "QQQ"
-        ):
-            spy_to_qqq += 1
+            continue
 
-            if not (
-                bool(row["SPX Cross Down"])
-                and bool(row["NDX Cross Up"])
-            ):
+        # ----------------------------------------------------
+        # QQQ transitions
+        # ----------------------------------------------------
+
+        if old_holding == "QQQ":
+
+            if new_holding == "SPY":
+                qqq_to_spy += 1
+
+                if not (
+                    ndx_cross_down
+                    and spy_entry_event
+                ):
+                    raise RuntimeError(
+                        "Illegal QQQ -> SPY switch on "
+                        f"{signal_date.date()}. "
+                        "Direct switching requires same-day "
+                        "QQQ exit + fresh valid SPY entry."
+                    )
+
+            elif new_holding == DEFENSIVE_ASSET:
+                if not ndx_cross_down:
+                    raise RuntimeError(
+                        "Illegal QQQ -> AGG transition on "
+                        f"{signal_date.date()}: no QQQ exit event."
+                    )
+
+            elif new_holding != "QQQ":
                 raise RuntimeError(
-                    "Illegal SPY -> QQQ switch on "
-                    f"{signal_date.date()}. "
-                    "Direct switching requires same-day "
-                    "SPY exit + QQQ entry."
+                    f"Illegal QQQ transition: QQQ -> {new_holding}"
                 )
 
-        elif (
-            old_holding == "QQQ"
-            and new_holding not in [
-                "QQQ",
-                DEFENSIVE_ASSET,
-            ]
-        ):
-            raise RuntimeError(
-                f"Illegal QQQ transition: "
-                f"{old_holding} -> {new_holding}"
-            )
+        # ----------------------------------------------------
+        # SPY transitions
+        # ----------------------------------------------------
 
-        elif (
-            old_holding == "SPY"
-            and new_holding not in [
-                "SPY",
-                DEFENSIVE_ASSET,
-            ]
-        ):
-            raise RuntimeError(
-                f"Illegal SPY transition: "
-                f"{old_holding} -> {new_holding}"
-            )
+        elif old_holding == "SPY":
 
-        elif (
-            old_holding == DEFENSIVE_ASSET
-            and new_holding not in [
-                DEFENSIVE_ASSET,
-                "QQQ",
-                "SPY",
-            ]
-        ):
+            if new_holding == "QQQ":
+                spy_to_qqq += 1
+
+                if not (
+                    (not spy_ok)
+                    and ndx_cross_up
+                ):
+                    raise RuntimeError(
+                        "Illegal SPY -> QQQ switch on "
+                        f"{signal_date.date()}. "
+                        "Direct switching requires same-day "
+                        "SPY invalidation + fresh QQQ entry."
+                    )
+
+            elif new_holding == DEFENSIVE_ASSET:
+                if spy_ok:
+                    raise RuntimeError(
+                        "Illegal SPY -> AGG transition on "
+                        f"{signal_date.date()}: SPY AND condition "
+                        "was still valid."
+                    )
+
+            elif new_holding != "SPY":
+                raise RuntimeError(
+                    f"Illegal SPY transition: SPY -> {new_holding}"
+                )
+
+        # ----------------------------------------------------
+        # AGG transitions
+        # ----------------------------------------------------
+
+        elif old_holding == DEFENSIVE_ASSET:
+
+            if new_holding == "QQQ":
+                if not ndx_cross_up:
+                    raise RuntimeError(
+                        "Illegal AGG -> QQQ transition on "
+                        f"{signal_date.date()}: no fresh QQQ entry."
+                    )
+
+            elif new_holding == "SPY":
+                if not spy_entry_event:
+                    raise RuntimeError(
+                        "Illegal AGG -> SPY transition on "
+                        f"{signal_date.date()}: no fresh valid SPY entry."
+                    )
+
+            elif new_holding != DEFENSIVE_ASSET:
+                raise RuntimeError(
+                    f"Illegal {DEFENSIVE_ASSET} transition: "
+                    f"{old_holding} -> {new_holding}"
+                )
+
+        else:
             raise RuntimeError(
-                f"Illegal {DEFENSIVE_ASSET} transition: "
-                f"{old_holding} -> {new_holding}"
+                f"Unknown Position History state: {old_holding}"
             )
 
     return {
@@ -694,34 +828,21 @@ def run_backtest(
 
         if previous_date is None:
 
-            old_holding = INITIAL_HOLDING
+            # The reported backtest starts at this day's OPEN, but the
+            # strategy state itself was already built during the warm-up.
+            # Therefore the true holding immediately before this open is
+            # the state at the prior signal day's close, not automatically
+            # CASH. This prevents a fabricated CASH -> X history row.
+            old_holding = decisions.at[
+                signal_date,
+                "Current Holding",
+            ]
+
             holding = target
 
-            # CASH has a zero return. This is mainly a safety path in
-            # case the warm-up period has not produced an entry by the
-            # first reported backtest date.
-            if holding != INITIAL_HOLDING:
-                open_price = (
-                    prices[holding]
-                    .at[
-                        date,
-                        "Open",
-                    ]
-                )
-
-                close_price = (
-                    prices[holding]
-                    .at[
-                        date,
-                        "Close",
-                    ]
-                )
-
-                equity *= (
-                    close_price
-                    / open_price
-                )
-
+            # Record a real transition if the prior close decision changes
+            # the warm-up holding at this first reported open.
+            if holding != old_holding:
                 position_history.append(
                     {
                         "Change": (
@@ -743,6 +864,30 @@ def run_backtest(
                             reason
                         ),
                     }
+                )
+
+            # Performance reporting begins at this first open. Overnight
+            # return before the reporting start is intentionally excluded.
+            if holding != INITIAL_HOLDING:
+                open_price = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Open",
+                    ]
+                )
+
+                close_price = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Close",
+                    ]
+                )
+
+                equity *= (
+                    close_price
+                    / open_price
                 )
 
         # ====================================================
