@@ -22,11 +22,14 @@ from macro_data import BLS_SERIES_ID, build_daily_unemployment_state
 # SPY:
 #   A = SPX 当前月线 >= SPX 12个月移动平均线
 #   B = 最新已公布失业率 <= 失业率12个月移动平均线
-#   SPY Condition = A OR B
+#   Macro Condition = A OR B
+#   SPY Condition = (NDX <= MA30) AND Macro Condition
 #
-#   入场：SPY Condition False -> True
+#   入场：Macro Condition False -> True
 #         且当天 NDX <= MA30（条件1不满足）
-#   出场：SPY Condition True -> False
+#   持有：NDX <= MA30 AND Macro Condition = True
+#   出场：SPY Condition 任一部分失效：
+#         NDX > MA30 OR Macro Condition = False
 #
 # SPX 月线每天收盘后更新：
 #   SPX Month Close = 当天 SPX Close
@@ -100,10 +103,46 @@ def build_spx_monthly_state(spx_close: pd.Series) -> pd.DataFrame:
 # ============================================================
 
 def build_signals(ndx, spx, unemployment_daily):
-    ndx_state = pd.DataFrame({"NDX Close": ndx["Close"]})
-    ndx_state["NDX MA30"] = ndx_state["NDX Close"].rolling(30, min_periods=30).mean()
+    """
+    Build daily Strategy 2 states and fresh entry/exit events.
 
-    spx_monthly = build_spx_monthly_state(spx["Close"])
+    QQQ:
+        NDX > MA30
+
+    Macro Condition:
+        SPX current-month close >= dynamic 12M MA
+        OR
+        latest available unemployment rate <= its 12M MA
+
+    SPY valid / hold condition:
+        NDX <= MA30 AND Macro Condition
+
+    Important:
+        A new SPY entry is NOT created merely because the full SPY
+        condition becomes true due to NDX falling below MA30.
+
+        SPY entry requires a fresh Macro Condition False -> True event
+        while NDX <= MA30 on that same signal day.
+    """
+
+    ndx_state = pd.DataFrame(
+        {
+            "NDX Close": ndx["Close"]
+        }
+    )
+
+    ndx_state["NDX MA30"] = (
+        ndx_state["NDX Close"]
+        .rolling(
+            30,
+            min_periods=30,
+        )
+        .mean()
+    )
+
+    spx_monthly = build_spx_monthly_state(
+        spx["Close"]
+    )
 
     macro_columns = [
         "Reference Month",
@@ -113,12 +152,25 @@ def build_signals(ndx, spx, unemployment_daily):
         "Unemployment <= 12M MA",
         "Release Date Source",
     ]
-    missing = [c for c in macro_columns if c not in unemployment_daily.columns]
+
+    missing = [
+        column
+        for column in macro_columns
+        if column not in unemployment_daily.columns
+    ]
+
     if missing:
-        raise RuntimeError("Missing unemployment columns: " + ", ".join(missing))
+        raise RuntimeError(
+            "Missing unemployment columns: "
+            + ", ".join(missing)
+        )
 
     signals = pd.concat(
-        [ndx_state, spx_monthly, unemployment_daily[macro_columns]],
+        [
+            ndx_state,
+            spx_monthly,
+            unemployment_daily[macro_columns],
+        ],
         axis=1,
         join="inner",
     )
@@ -135,26 +187,95 @@ def build_signals(ndx, spx, unemployment_daily):
     ).copy()
 
     if signals.empty:
-        raise RuntimeError("No common valid Strategy 2 signal dates.")
+        raise RuntimeError(
+            "No common valid Strategy 2 signal dates."
+        )
 
-    # 当前状态
-    signals["NDX > MA30"] = signals["NDX Close"] > signals["NDX MA30"]
-    signals["SPX >= 12M MA"] = signals["SPX Month Close"] >= signals["SPX 12M MA"]
+    # ========================================================
+    # CURRENT STATES
+    # ========================================================
+
+    signals["NDX > MA30"] = (
+        signals["NDX Close"]
+        > signals["NDX MA30"]
+    )
+
+    signals["SPX >= 12M MA"] = (
+        signals["SPX Month Close"]
+        >= signals["SPX 12M MA"]
+    )
+
     signals["Unemployment <= 12M MA"] = (
-        signals["Unemployment Rate"] <= signals["Unemployment 12M MA"]
+        signals["Unemployment Rate"]
+        <= signals["Unemployment 12M MA"]
     )
+
+    # Macro side of Strategy 2.
+    signals["Macro Condition"] = (
+        signals["SPX >= 12M MA"]
+        | signals["Unemployment <= 12M MA"]
+    )
+
+    # Full SPY validity is an AND condition.
     signals["SPY Condition"] = (
-        signals["SPX >= 12M MA"] | signals["Unemployment <= 12M MA"]
+        (~signals["NDX > MA30"])
+        & signals["Macro Condition"]
     )
 
-    # 新鲜触发：第一条有效数据不算 cross
-    prev_ndx_above = signals["NDX > MA30"].shift(1)
-    prev_spy_condition = signals["SPY Condition"].shift(1)
+    # ========================================================
+    # FRESH EVENTS
+    # ========================================================
 
-    signals["NDX Cross Up"] = signals["NDX > MA30"] & prev_ndx_above.eq(False)
-    signals["NDX Cross Down"] = (~signals["NDX > MA30"]) & prev_ndx_above.eq(True)
-    signals["SPY Cross Up"] = signals["SPY Condition"] & prev_spy_condition.eq(False)
-    signals["SPY Cross Down"] = (~signals["SPY Condition"]) & prev_spy_condition.eq(True)
+    previous_ndx_above = (
+        signals["NDX > MA30"]
+        .shift(1)
+    )
+
+    previous_macro_condition = (
+        signals["Macro Condition"]
+        .shift(1)
+    )
+
+    previous_spy_condition = (
+        signals["SPY Condition"]
+        .shift(1)
+    )
+
+    # First valid row is never treated as a cross.
+    signals["NDX Cross Up"] = (
+        signals["NDX > MA30"]
+        & previous_ndx_above.eq(False)
+    )
+
+    signals["NDX Cross Down"] = (
+        (~signals["NDX > MA30"])
+        & previous_ndx_above.eq(True)
+    )
+
+    signals["Macro Cross Up"] = (
+        signals["Macro Condition"]
+        & previous_macro_condition.eq(False)
+    )
+
+    signals["Macro Cross Down"] = (
+        (~signals["Macro Condition"])
+        & previous_macro_condition.eq(True)
+    )
+
+    # SPY Cross Up means a FRESH VALID SPY ENTRY EVENT:
+    # Macro Condition freshly turns True while NDX <= MA30.
+    # A later NDX down-cross while Macro Condition was already True
+    # does NOT create a new SPY entry event.
+    signals["SPY Cross Up"] = (
+        signals["Macro Cross Up"]
+        & (~signals["NDX > MA30"])
+    )
+
+    # SPY Cross Down tracks the full AND condition becoming invalid.
+    signals["SPY Cross Down"] = (
+        (~signals["SPY Condition"])
+        & previous_spy_condition.eq(True)
+    )
 
     return signals
 
@@ -163,7 +284,44 @@ def build_signals(ndx, spx, unemployment_daily):
 # 状态机
 # ============================================================
 
-def apply_state_machine(signals, initial_holding=INITIAL_HOLDING):
+def apply_state_machine(
+    signals,
+    initial_holding=INITIAL_HOLDING,
+):
+    """
+    Convert daily close events into next-open Strategy 2 decisions.
+
+    QQQ entry:
+        NDX fresh cross from <= MA30 to > MA30.
+
+    QQQ exit:
+        NDX fresh cross from > MA30 to <= MA30.
+
+    Macro Condition:
+        SPX >= dynamic 12M MA OR unemployment <= unemployment 12M MA.
+
+    SPY valid / hold condition:
+        NDX <= MA30 AND Macro Condition.
+
+    SPY fresh entry:
+        Macro Condition fresh crosses False -> True while NDX <= MA30.
+
+    SPY exit:
+        The full SPY AND condition becomes false for any reason:
+        NDX > MA30 OR Macro Condition == False.
+
+    Direct switching:
+        QQQ -> SPY only when QQQ exits and SPY has a fresh valid
+        entry event on the same signal day.
+
+        SPY -> QQQ only when SPY becomes invalid and QQQ has a fresh
+        NDX up-cross on the same signal day.
+
+    CASH is only the seed state. After first leaving CASH, normal
+    defensive exits go to AGG and the strategy never intentionally
+    returns to CASH.
+    """
+
     result = signals.copy()
     current_holding = initial_holding
 
@@ -172,98 +330,217 @@ def apply_state_machine(signals, initial_holding=INITIAL_HOLDING):
     reasons = []
 
     for _, row in result.iterrows():
-        holding = current_holding
-        ndx_above = bool(row["NDX > MA30"])
-        ndx_up = bool(row["NDX Cross Up"])
-        ndx_down = bool(row["NDX Cross Down"])
-        spy_condition = bool(row["SPY Condition"])
-        spy_up = bool(row["SPY Cross Up"])
-        spy_down = bool(row["SPY Cross Down"])
+        holding_at_close = current_holding
 
-        next_holding = holding
+        ndx_above = bool(
+            row["NDX > MA30"]
+        )
 
-        if holding == "QQQ":
-            if ndx_down:
-                if spy_up:
+        ndx_cross_up = bool(
+            row["NDX Cross Up"]
+        )
+
+        ndx_cross_down = bool(
+            row["NDX Cross Down"]
+        )
+
+        macro_condition = bool(
+            row["Macro Condition"]
+        )
+
+        macro_cross_up = bool(
+            row["Macro Cross Up"]
+        )
+
+        spy_ok = bool(
+            row["SPY Condition"]
+        )
+
+        # This is the only fresh SPY entry event.
+        spy_entry_event = bool(
+            row["SPY Cross Up"]
+        )
+
+        next_holding = holding_at_close
+
+        # ====================================================
+        # CURRENTLY QQQ
+        # ====================================================
+
+        if holding_at_close == "QQQ":
+
+            if ndx_cross_down:
+
+                # Direct QQQ -> SPY is allowed only when the SPY
+                # macro trigger also freshly fires on this same day.
+                if spy_entry_event:
                     next_holding = "SPY"
                     reason = (
-                        "NDX crossed to/below MA30 and SPY Condition crossed "
-                        "False→True on the same day → QQQ → SPY"
+                        "NDX crossed to/below MA30 and Macro Condition "
+                        "crossed False→True on the same day while "
+                        "NDX <= MA30 → QQQ → SPY"
                     )
+
                 else:
                     next_holding = DEFENSIVE_ASSET
-                    reason = f"NDX crossed to/below MA30 → QQQ exit → {DEFENSIVE_ASSET}"
+                    reason = (
+                        "NDX crossed to/below MA30 "
+                        f"→ QQQ exit → {DEFENSIVE_ASSET}"
+                    )
+
             else:
                 next_holding = "QQQ"
-                reason = "Hold QQQ — no NDX down-cross to/below MA30"
+                reason = (
+                    "Hold QQQ — NDX remains above MA30 "
+                    "with no fresh down-cross"
+                )
 
-        elif holding == "SPY":
-            if spy_down:
-                if ndx_up:
+        # ====================================================
+        # CURRENTLY SPY
+        # ====================================================
+
+        elif holding_at_close == "SPY":
+
+            # SPY must continuously satisfy BOTH:
+            #   NDX <= MA30
+            #   Macro Condition == True
+            # If either one fails, SPY exits.
+            if not spy_ok:
+
+                # If NDX fresh-crosses above MA30 today, SPY becomes
+                # invalid and QQQ receives a fresh entry on the same
+                # signal day, so direct SPY -> QQQ is legal.
+                if ndx_cross_up:
                     next_holding = "QQQ"
                     reason = (
-                        "SPY Condition crossed True→False and NDX crossed above MA30 "
-                        "on the same day → SPY → QQQ"
+                        "SPY condition became invalid because NDX "
+                        "crossed above MA30, and QQQ received a fresh "
+                        "entry on the same day → SPY → QQQ"
                     )
+
                 else:
                     next_holding = DEFENSIVE_ASSET
-                    reason = f"SPY Condition crossed True→False → SPY exit → {DEFENSIVE_ASSET}"
+
+                    if ndx_above:
+                        reason = (
+                            "SPY condition invalid: NDX > MA30 "
+                            f"→ SPY exit → {DEFENSIVE_ASSET}"
+                        )
+                    elif not macro_condition:
+                        reason = (
+                            "SPY condition invalid: Macro Condition is False "
+                            f"→ SPY exit → {DEFENSIVE_ASSET}"
+                        )
+                    else:
+                        reason = (
+                            "SPY AND condition became invalid "
+                            f"→ SPY exit → {DEFENSIVE_ASSET}"
+                        )
+
             else:
                 next_holding = "SPY"
-                reason = "Hold SPY — no SPY Condition True→False exit"
+                reason = (
+                    "Hold SPY — NDX <= MA30 AND Macro Condition is True"
+                )
 
-        elif holding == INITIAL_HOLDING:
-            # CASH 只作为最早 seed。条件1优先。
-            if ndx_up:
+        # ====================================================
+        # INITIAL SEED STATE: CASH
+        # ====================================================
+
+        elif holding_at_close == INITIAL_HOLDING:
+
+            # Rule 1 / QQQ has priority.
+            if ndx_cross_up:
                 next_holding = "QQQ"
-                reason = "NDX crossed above MA30 → initial QQQ entry"
-            elif spy_up and not ndx_above:
+                reason = (
+                    "NDX crossed above MA30 → initial QQQ entry"
+                )
+
+            elif spy_entry_event:
                 next_holding = "SPY"
-                reason = "SPY Condition crossed False→True and NDX <= MA30 → initial SPY entry"
+                reason = (
+                    "Macro Condition crossed False→True while "
+                    "NDX <= MA30 → initial SPY entry"
+                )
+
             else:
                 next_holding = INITIAL_HOLDING
-                if spy_up and ndx_above:
+
+                if macro_cross_up and ndx_above:
                     reason = (
-                        "SPY Condition crossed False→True, but Rule 1 is satisfied "
-                        "(NDX > MA30) → stay CASH"
+                        "Macro Condition crossed False→True, but "
+                        "NDX > MA30 so the SPY AND condition is invalid "
+                        "→ stay CASH"
                     )
                 else:
-                    reason = "No fresh valid initial entry event → stay CASH"
+                    reason = (
+                        "No new valid initial entry event → stay CASH"
+                    )
 
-        elif holding == DEFENSIVE_ASSET:
-            # AGG 等待新的触发，条件1优先。
-            if ndx_up:
+        # ====================================================
+        # CURRENTLY DEFENSIVE ASSET (AGG)
+        # ====================================================
+
+        elif holding_at_close == DEFENSIVE_ASSET:
+
+            # Rule 1 / QQQ has priority.
+            if ndx_cross_up:
                 next_holding = "QQQ"
-                reason = "NDX crossed above MA30 → QQQ entry"
-            elif spy_up and not ndx_above:
+                reason = (
+                    "NDX crossed above MA30 → QQQ entry"
+                )
+
+            elif spy_entry_event:
                 next_holding = "SPY"
-                reason = "SPY Condition crossed False→True and NDX <= MA30 → SPY entry"
+                reason = (
+                    "Macro Condition crossed False→True while "
+                    "NDX <= MA30 → SPY entry"
+                )
+
             else:
                 next_holding = DEFENSIVE_ASSET
-                if spy_up and ndx_above:
+
+                if macro_cross_up and ndx_above:
                     reason = (
-                        "SPY Condition crossed False→True, but Rule 1 is satisfied "
-                        f"(NDX > MA30) → stay {DEFENSIVE_ASSET}"
+                        "Macro Condition crossed False→True, but "
+                        "NDX > MA30 so the SPY AND condition is invalid "
+                        f"→ stay {DEFENSIVE_ASSET}"
                     )
-                elif spy_condition:
+                elif spy_ok:
                     reason = (
-                        "SPY Condition is already True but did not freshly trigger today "
+                        "SPY condition is currently valid but there was "
+                        "no fresh Macro False→True entry event today "
                         f"→ stay {DEFENSIVE_ASSET}"
                     )
                 else:
-                    reason = f"No fresh valid entry event → stay {DEFENSIVE_ASSET}"
+                    reason = (
+                        "No new valid entry event "
+                        f"→ stay {DEFENSIVE_ASSET}"
+                    )
 
         else:
-            raise RuntimeError(f"Unknown holding state: {holding}")
+            raise RuntimeError(
+                f"Unknown holding state: {holding_at_close}"
+            )
 
-        current_holdings.append(holding)
-        next_holdings.append(next_holding)
-        reasons.append(reason)
+        current_holdings.append(
+            holding_at_close
+        )
+
+        next_holdings.append(
+            next_holding
+        )
+
+        reasons.append(
+            reason
+        )
+
         current_holding = next_holding
 
     result["Current Holding"] = current_holdings
     result["Signal"] = next_holdings
     result["Reason"] = reasons
+
     return result
 
 
@@ -271,7 +548,26 @@ def apply_state_machine(signals, initial_holding=INITIAL_HOLDING):
 # 状态机硬校验
 # ============================================================
 
-def validate_state_machine(decisions, position_history):
+def validate_state_machine(
+    decisions,
+    position_history,
+):
+    """
+    Hard validation for Strategy 2 transitions.
+
+    QQQ -> SPY requires same-day:
+        QQQ exit (NDX Cross Down)
+        fresh valid SPY entry (Macro Cross Up while NDX <= MA30)
+
+    SPY -> QQQ requires same-day:
+        full SPY condition invalid
+        fresh QQQ entry (NDX Cross Up)
+
+    QQQ -> AGG requires a fresh QQQ exit.
+    SPY -> AGG requires the full SPY AND condition to be invalid.
+    AGG -> QQQ / SPY requires a fresh valid entry event.
+    """
+
     qqq_to_spy = 0
     spy_to_qqq = 0
 
@@ -279,73 +575,159 @@ def validate_state_machine(decisions, position_history):
         old_holding = change["From"]
         new_holding = change["To"]
 
-        # 2016回测展示初始化，不当作历史真实换仓来校验。
-        if old_holding == INITIAL_HOLDING:
-            continue
+        signal_date = pd.Timestamp(
+            change["Signal Date"]
+        )
 
-        signal_date = pd.Timestamp(change["Signal Date"])
         if signal_date not in decisions.index:
             raise RuntimeError(
-                f"Position History signal date missing from decisions: {signal_date.date()}"
+                "Position History signal date missing from decisions: "
+                f"{signal_date.date()}"
             )
 
-        row = decisions.loc[signal_date]
-        ndx_above = bool(row["NDX > MA30"])
-        ndx_up = bool(row["NDX Cross Up"])
-        ndx_down = bool(row["NDX Cross Down"])
-        spy_up = bool(row["SPY Cross Up"])
-        spy_down = bool(row["SPY Cross Down"])
+        row = decisions.loc[
+            signal_date
+        ]
+
+        ndx_cross_up = bool(
+            row["NDX Cross Up"]
+        )
+
+        ndx_cross_down = bool(
+            row["NDX Cross Down"]
+        )
+
+        spy_ok = bool(
+            row["SPY Condition"]
+        )
+
+        spy_entry_event = bool(
+            row["SPY Cross Up"]
+        )
+
+        # ----------------------------------------------------
+        # Initial CASH allocation
+        # ----------------------------------------------------
+
+        if old_holding == INITIAL_HOLDING:
+
+            if new_holding == "QQQ":
+                if not ndx_cross_up:
+                    raise RuntimeError(
+                        "Illegal CASH -> QQQ transition on "
+                        f"{signal_date.date()}: no fresh NDX up-cross."
+                    )
+
+            elif new_holding == "SPY":
+                if not spy_entry_event:
+                    raise RuntimeError(
+                        "Illegal CASH -> SPY transition on "
+                        f"{signal_date.date()}: no fresh valid SPY entry."
+                    )
+
+            elif new_holding != INITIAL_HOLDING:
+                raise RuntimeError(
+                    f"Illegal CASH transition: CASH -> {new_holding}"
+                )
+
+            continue
+
+        # ----------------------------------------------------
+        # QQQ transitions
+        # ----------------------------------------------------
 
         if old_holding == "QQQ":
+
             if new_holding == "SPY":
                 qqq_to_spy += 1
-                if not (ndx_down and spy_up):
+
+                if not (
+                    ndx_cross_down
+                    and spy_entry_event
+                ):
                     raise RuntimeError(
-                        f"Illegal QQQ -> SPY on {signal_date.date()}: "
-                        "requires same-day QQQ exit + fresh SPY entry."
+                        "Illegal QQQ -> SPY on "
+                        f"{signal_date.date()}: direct switching "
+                        "requires same-day QQQ exit + fresh valid SPY entry."
                     )
+
             elif new_holding == DEFENSIVE_ASSET:
-                if not ndx_down:
+                if not ndx_cross_down:
                     raise RuntimeError(
-                        f"Illegal QQQ -> AGG on {signal_date.date()}: no NDX down-cross."
+                        "Illegal QQQ -> AGG on "
+                        f"{signal_date.date()}: no NDX down-cross."
                     )
-            else:
-                raise RuntimeError(f"Illegal QQQ transition: {old_holding} -> {new_holding}")
+
+            elif new_holding != "QQQ":
+                raise RuntimeError(
+                    f"Illegal QQQ transition: {old_holding} -> {new_holding}"
+                )
+
+        # ----------------------------------------------------
+        # SPY transitions
+        # ----------------------------------------------------
 
         elif old_holding == "SPY":
+
             if new_holding == "QQQ":
                 spy_to_qqq += 1
-                if not (spy_down and ndx_up):
+
+                if not (
+                    (not spy_ok)
+                    and ndx_cross_up
+                ):
                     raise RuntimeError(
-                        f"Illegal SPY -> QQQ on {signal_date.date()}: "
-                        "requires same-day SPY exit + fresh QQQ entry."
+                        "Illegal SPY -> QQQ on "
+                        f"{signal_date.date()}: direct switching requires "
+                        "same-day SPY invalidation + fresh QQQ entry."
                     )
+
             elif new_holding == DEFENSIVE_ASSET:
-                if not spy_down:
+                if spy_ok:
                     raise RuntimeError(
-                        f"Illegal SPY -> AGG on {signal_date.date()}: no SPY down-cross."
+                        "Illegal SPY -> AGG on "
+                        f"{signal_date.date()}: SPY AND condition was still valid."
                     )
-            else:
-                raise RuntimeError(f"Illegal SPY transition: {old_holding} -> {new_holding}")
+
+            elif new_holding != "SPY":
+                raise RuntimeError(
+                    f"Illegal SPY transition: {old_holding} -> {new_holding}"
+                )
+
+        # ----------------------------------------------------
+        # AGG transitions
+        # ----------------------------------------------------
 
         elif old_holding == DEFENSIVE_ASSET:
-            if new_holding == "QQQ":
-                if not ndx_up:
-                    raise RuntimeError(
-                        f"Illegal AGG -> QQQ on {signal_date.date()}: no fresh NDX up-cross."
-                    )
-            elif new_holding == "SPY":
-                if not (spy_up and not ndx_above):
-                    raise RuntimeError(
-                        f"Illegal AGG -> SPY on {signal_date.date()}: requires fresh "
-                        "SPY up-cross and NDX <= MA30."
-                    )
-            else:
-                raise RuntimeError(f"Illegal AGG transition: {old_holding} -> {new_holding}")
-        else:
-            raise RuntimeError(f"Unexpected prior holding: {old_holding}")
 
-    return {"QQQ -> SPY": qqq_to_spy, "SPY -> QQQ": spy_to_qqq}
+            if new_holding == "QQQ":
+                if not ndx_cross_up:
+                    raise RuntimeError(
+                        "Illegal AGG -> QQQ on "
+                        f"{signal_date.date()}: no fresh NDX up-cross."
+                    )
+
+            elif new_holding == "SPY":
+                if not spy_entry_event:
+                    raise RuntimeError(
+                        "Illegal AGG -> SPY on "
+                        f"{signal_date.date()}: no fresh valid SPY entry."
+                    )
+
+            elif new_holding != DEFENSIVE_ASSET:
+                raise RuntimeError(
+                    f"Illegal AGG transition: {old_holding} -> {new_holding}"
+                )
+
+        else:
+            raise RuntimeError(
+                f"Unexpected prior holding: {old_holding}"
+            )
+
+    return {
+        "QQQ -> SPY": qqq_to_spy,
+        "SPY -> QQQ": spy_to_qqq,
+    }
 
 
 # ============================================================
@@ -376,71 +758,113 @@ def apply_intraday_return(equity, holding, prices, date):
 
 def run_backtest(signals, prices):
     common_index = signals.index.copy()
+
     for ticker in ASSETS:
-        common_index = common_index.intersection(prices[ticker].index)
+        common_index = common_index.intersection(
+            prices[ticker].index
+        )
+
     common_index = common_index.sort_values()
 
     if len(common_index) < 2:
-        raise RuntimeError("Not enough common trading dates to run Strategy 2.")
+        raise RuntimeError(
+            "Not enough common trading dates to run Strategy 2."
+        )
 
-    # 先在完整 warm-up 历史上运行状态机，再从2016开始展示。
-    decisions = apply_state_machine(signals.loc[common_index].copy())
+    # Run the event-driven state machine on the FULL warm-up
+    # history before cutting the displayed backtest to 2016.
+    decisions = apply_state_machine(
+        signals.loc[common_index].copy()
+    )
 
-    execution = pd.DataFrame(index=common_index)
-    execution["Target"] = decisions["Signal"].shift(1)
-    execution["Reason"] = decisions["Reason"].shift(1)
-    execution["Signal Date"] = pd.Series(common_index, index=common_index).shift(1)
+    execution = pd.DataFrame(
+        index=common_index
+    )
 
-    execution = execution.loc[execution.index >= BACKTEST_START].copy()
-    execution = execution.dropna(subset=["Target", "Signal Date"])
+    execution["Target"] = (
+        decisions["Signal"]
+        .shift(1)
+    )
+
+    execution["Reason"] = (
+        decisions["Reason"]
+        .shift(1)
+    )
+
+    execution["Signal Date"] = (
+        pd.Series(
+            common_index,
+            index=common_index,
+        )
+        .shift(1)
+    )
+
+    execution = execution.loc[
+        execution.index >= BACKTEST_START
+    ].copy()
+
+    execution = execution.dropna(
+        subset=[
+            "Target",
+            "Signal Date",
+        ]
+    )
+
     if execution.empty:
-        raise RuntimeError("No Strategy 2 backtest dates available after 2016.")
+        raise RuntimeError(
+            "No Strategy 2 backtest dates available after 2016."
+        )
 
-    expected_current = decisions.loc[execution.index, "Current Holding"]
-    mismatch = execution["Target"] != expected_current
+    expected_current = decisions.loc[
+        execution.index,
+        "Current Holding",
+    ]
+
+    mismatch = (
+        execution["Target"]
+        != expected_current
+    )
+
     if mismatch.any():
-        bad_date = mismatch[mismatch].index[0]
-        raise RuntimeError(f"State-machine/execution mismatch on {bad_date.date()}.")
+        bad_date = mismatch[
+            mismatch
+        ].index[0]
+
+        raise RuntimeError(
+            "State-machine/execution mismatch on "
+            f"{bad_date.date()}."
+        )
 
     equity = 1.0
     holding = None
     previous_date = None
+
     daily_rows = []
     position_history = []
 
     for date, row in execution.iterrows():
         target = row["Target"]
-        signal_date = pd.Timestamp(row["Signal Date"])
+        signal_date = pd.Timestamp(
+            row["Signal Date"]
+        )
         reason = row["Reason"]
 
+        # ====================================================
+        # FIRST REPORTED TRADING DAY
+        # ====================================================
+
         if previous_date is None:
+
+            # The strategy state already exists from pre-2016 warm-up.
+            # Use that true prior holding rather than fabricating CASH -> X.
+            old_holding = decisions.at[
+                signal_date,
+                "Current Holding",
+            ]
+
             holding = target
-            equity = apply_intraday_return(equity, holding, prices, date)
 
-            if holding != INITIAL_HOLDING:
-                position_history.append(
-                    {
-                        "Change": f"{INITIAL_HOLDING} → {holding}",
-                        "Signal Date": signal_date,
-                        "Execute Date": date,
-                        "From": INITIAL_HOLDING,
-                        "To": holding,
-                        "Reason": (
-                            "2016 reporting initialization from pre-2016 warm-up state; "
-                            + str(reason)
-                        ),
-                    }
-                )
-        else:
-            # 昨收 -> 今开属于旧持仓。
-            equity = apply_overnight_return(
-                equity, holding, prices, previous_date, date
-            )
-
-            # 今开执行昨天收盘信号。
-            if target != holding:
-                old_holding = holding
-                holding = target
+            if holding != old_holding:
                 position_history.append(
                     {
                         "Change": f"{old_holding} → {holding}",
@@ -452,10 +876,57 @@ def run_backtest(signals, prices):
                     }
                 )
 
-            # 今开 -> 今收属于新持仓。
-            equity = apply_intraday_return(equity, holding, prices, date)
+            # Performance reporting starts at this day's OPEN.
+            if holding != INITIAL_HOLDING:
+                equity = apply_intraday_return(
+                    equity,
+                    holding,
+                    prices,
+                    date,
+                )
 
-        d = decisions.loc[date]
+        # ====================================================
+        # LATER TRADING DAYS
+        # ====================================================
+
+        else:
+            # Previous close -> today's open belongs to the OLD holding.
+            equity = apply_overnight_return(
+                equity,
+                holding,
+                prices,
+                previous_date,
+                date,
+            )
+
+            # Today's open executes yesterday close's signal.
+            if target != holding:
+                old_holding = holding
+                holding = target
+
+                position_history.append(
+                    {
+                        "Change": f"{old_holding} → {holding}",
+                        "Signal Date": signal_date,
+                        "Execute Date": date,
+                        "From": old_holding,
+                        "To": holding,
+                        "Reason": reason,
+                    }
+                )
+
+            # Today's open -> close belongs to the NEW/current holding.
+            equity = apply_intraday_return(
+                equity,
+                holding,
+                prices,
+                date,
+            )
+
+        decision_today = decisions.loc[
+            date
+        ]
+
         daily_rows.append(
             {
                 "Date": date,
@@ -464,35 +935,67 @@ def run_backtest(signals, prices):
                 "Target": target,
                 "Signal Date": signal_date,
                 "Signal Reason": reason,
-                "Today's Signal": d["Signal"],
-                "Today's Reason": d["Reason"],
-                "NDX Close": d["NDX Close"],
-                "NDX MA30": d["NDX MA30"],
-                "NDX > MA30": d["NDX > MA30"],
-                "NDX Cross Up": d["NDX Cross Up"],
-                "NDX Cross Down": d["NDX Cross Down"],
-                "SPX Month Close": d["SPX Month Close"],
-                "SPX 12M MA": d["SPX 12M MA"],
-                "SPX >= 12M MA": d["SPX >= 12M MA"],
-                "Unemployment Reference Month": str(d["Reference Month"]),
-                "Unemployment Release Date": pd.Timestamp(d["Release Date"]),
-                "Unemployment Rate": d["Unemployment Rate"],
-                "Unemployment 12M MA": d["Unemployment 12M MA"],
-                "Unemployment <= 12M MA": d["Unemployment <= 12M MA"],
-                "SPY Condition": d["SPY Condition"],
-                "SPY Cross Up": d["SPY Cross Up"],
-                "SPY Cross Down": d["SPY Cross Down"],
+                "Today's Signal": decision_today["Signal"],
+                "Today's Reason": decision_today["Reason"],
+                "NDX Close": decision_today["NDX Close"],
+                "NDX MA30": decision_today["NDX MA30"],
+                "NDX > MA30": decision_today["NDX > MA30"],
+                "NDX Cross Up": decision_today["NDX Cross Up"],
+                "NDX Cross Down": decision_today["NDX Cross Down"],
+                "SPX Month Close": decision_today["SPX Month Close"],
+                "SPX 12M MA": decision_today["SPX 12M MA"],
+                "SPX >= 12M MA": decision_today["SPX >= 12M MA"],
+                "Unemployment Reference Month": str(
+                    decision_today["Reference Month"]
+                ),
+                "Unemployment Release Date": pd.Timestamp(
+                    decision_today["Release Date"]
+                ),
+                "Unemployment Rate": decision_today["Unemployment Rate"],
+                "Unemployment 12M MA": decision_today["Unemployment 12M MA"],
+                "Unemployment <= 12M MA": decision_today[
+                    "Unemployment <= 12M MA"
+                ],
+                "Macro Condition": decision_today["Macro Condition"],
+                "Macro Cross Up": decision_today["Macro Cross Up"],
+                "Macro Cross Down": decision_today["Macro Cross Down"],
+                "SPY Condition": decision_today["SPY Condition"],
+                "SPY Cross Up": decision_today["SPY Cross Up"],
+                "SPY Cross Down": decision_today["SPY Cross Down"],
             }
         )
+
         previous_date = date
 
-    daily = pd.DataFrame(daily_rows).set_index("Date")
+    daily = pd.DataFrame(
+        daily_rows
+    ).set_index(
+        "Date"
+    )
+
     history = pd.DataFrame(
         position_history,
-        columns=["Change", "Signal Date", "Execute Date", "From", "To", "Reason"],
+        columns=[
+            "Change",
+            "Signal Date",
+            "Execute Date",
+            "From",
+            "To",
+            "Reason",
+        ],
     )
-    validation = validate_state_machine(decisions, history)
-    return daily, history, decisions, validation
+
+    validation = validate_state_machine(
+        decisions,
+        history,
+    )
+
+    return (
+        daily,
+        history,
+        decisions,
+        validation,
+    )
 
 
 # ============================================================
@@ -647,6 +1150,9 @@ def main():
         "Unemployment Rate": float(latest["Unemployment Rate"]),
         "Unemployment 12M MA": float(latest["Unemployment 12M MA"]),
         "Unemployment <= 12M MA": bool(latest["Unemployment <= 12M MA"]),
+        "Macro Condition": bool(latest["Macro Condition"]),
+        "Macro Cross Up": bool(latest["Macro Cross Up"]),
+        "Macro Cross Down": bool(latest["Macro Cross Down"]),
         "SPY Condition": bool(latest["SPY Condition"]),
         "SPY Cross Up": bool(latest["SPY Cross Up"]),
         "SPY Cross Down": bool(latest["SPY Cross Down"]),
@@ -715,7 +1221,11 @@ def main():
     print(f"Unemployment 12M MA : {current_status['Unemployment 12M MA']:.2f}%")
     print("Unemp <= 12M MA     :", current_status["Unemployment <= 12M MA"])
 
-    print("\nSPY Condition       :", current_status["SPY Condition"])
+    print("Macro Condition     :", current_status["Macro Condition"])
+    print("Macro Cross Up      :", current_status["Macro Cross Up"])
+    print("Macro Cross Down    :", current_status["Macro Cross Down"])
+
+    print("SPY Condition       :", current_status["SPY Condition"])
     print("SPY Cross Up        :", current_status["SPY Cross Up"])
     print("SPY Cross Down      :", current_status["SPY Cross Down"])
     print("Reason              :", current_status["Reason"])
