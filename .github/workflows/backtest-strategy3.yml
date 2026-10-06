@@ -35,7 +35,7 @@ jobs:
       - name: Sync Strategy 3 to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          FULL_REBUILD: "true"
+          FULL_REBUILD: "false"
         run: python strategy3_sync.py
 
       - name: Upload Strategy 3 output
