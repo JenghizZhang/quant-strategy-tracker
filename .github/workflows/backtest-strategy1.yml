@@ -38,6 +38,8 @@ jobs:
 
           CURRENT_POSITIONS_DATA_SOURCE_ID: ${{ secrets.CURRENT_POSITIONS_DATA_SOURCE_ID }}
 
+          STRATEGY_OVERVIEW_DATA_SOURCE_ID: ${{ secrets.STRATEGY_OVERVIEW_DATA_SOURCE_ID }}
+
         run: python notion_sync.py
 
       - name: Upload backtest results
