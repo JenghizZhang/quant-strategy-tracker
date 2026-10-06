@@ -34,6 +34,8 @@ jobs:
 
           STRATEGY1_ANNUAL_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_ANNUAL_DATA_SOURCE_ID }}
 
+          STRATEGY1_HISTORY_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_HISTORY_DATA_SOURCE_ID }}
+
         run: python notion_sync.py
 
       - name: Upload backtest results
