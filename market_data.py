@@ -1,4 +1,5 @@
 from datetime import timedelta
+import math
 
 import pandas as pd
 import pandas_market_calendars as mcal
@@ -12,46 +13,130 @@ class LatestSessionUnavailable(RuntimeError):
     pass
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _valid_price(value):
+    """
+    A usable market price must be:
+    - not NaN
+    - finite
+    - greater than zero
+    """
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+
+    return (
+        math.isfinite(value)
+        and value > 0
+    )
+
+
 def _normalize_daily_index(df):
     """
-    Convert Yahoo daily timestamps to plain trading dates.
+    Convert Yahoo daily timestamps to plain
+    trading dates.
     """
+
     df = df.copy()
 
-    idx = pd.DatetimeIndex(df.index)
+    idx = pd.DatetimeIndex(
+        df.index
+    )
 
     if idx.tz is not None:
         idx = idx.tz_localize(None)
 
     df.index = idx.normalize()
 
+    # Keep only one row per trading date.
     df = df[
-        ~df.index.duplicated(keep="last")
+        ~df.index.duplicated(
+            keep="last"
+        )
     ]
 
     return df.sort_index()
 
 
-def get_latest_completed_session(now=None):
+def _daily_row_is_valid(
+    df,
+    date,
+):
     """
-    Find the latest US stock-market session that has
-    already officially closed.
+    Yahoo can sometimes expose today's date
+    before today's daily OHLC row is complete.
 
-    This correctly handles:
+    Merely having the date is therefore NOT
+    sufficient.
+
+    Both Open and Close must contain valid
+    positive finite numbers.
+    """
+
+    if date not in df.index:
+        return False
+
+    row = df.loc[date]
+
+    return (
+        _valid_price(
+            row["Open"]
+        )
+        and
+        _valid_price(
+            row["Close"]
+        )
+    )
+
+
+# ============================================================
+# MARKET CALENDAR
+# ============================================================
+
+def get_latest_completed_session(
+    now=None,
+):
+    """
+    Find the latest US stock-market session
+    that has officially completed.
+
+    Handles:
     - weekends
-    - market holidays
-    - early-close days
+    - holidays
+    - normal closes
+    - early closes
     """
 
     if now is None:
-        now_utc = pd.Timestamp.now(tz="UTC")
+
+        now_utc = pd.Timestamp.now(
+            tz="UTC"
+        )
+
     else:
+
         now_utc = pd.Timestamp(now)
 
         if now_utc.tzinfo is None:
-            now_utc = now_utc.tz_localize("UTC")
+
+            now_utc = (
+                now_utc.tz_localize(
+                    "UTC"
+                )
+            )
+
         else:
-            now_utc = now_utc.tz_convert("UTC")
+
+            now_utc = (
+                now_utc.tz_convert(
+                    "UTC"
+                )
+            )
 
     now_et = now_utc.tz_convert(
         "America/New_York"
@@ -67,38 +152,55 @@ def get_latest_completed_session(now=None):
         + timedelta(days=1)
     )
 
-    schedule = MARKET_CALENDAR.schedule(
-        start_date=start_date,
-        end_date=end_date,
+    schedule = (
+        MARKET_CALENDAR.schedule(
+            start_date=start_date,
+            end_date=end_date,
+        )
     )
 
     if schedule.empty:
+
         raise LatestSessionUnavailable(
             "No market sessions found."
         )
 
     completed = schedule[
-        schedule["market_close"] <= now_utc
+        schedule["market_close"]
+        <= now_utc
     ]
 
     if completed.empty:
+
         raise LatestSessionUnavailable(
-            "No completed market session yet."
+            "No completed market "
+            "session yet."
         )
 
-    session_date = pd.Timestamp(
-        completed.index[-1]
-    ).normalize()
+    session_date = (
+        pd.Timestamp(
+            completed.index[-1]
+        )
+        .normalize()
+    )
 
-    session = completed.iloc[-1]
+    latest = (
+        completed.iloc[-1]
+    )
 
-    market_open = pd.Timestamp(
-        session["market_open"]
-    ).tz_convert("UTC")
+    market_open = (
+        pd.Timestamp(
+            latest["market_open"]
+        )
+        .tz_convert("UTC")
+    )
 
-    market_close = pd.Timestamp(
-        session["market_close"]
-    ).tz_convert("UTC")
+    market_close = (
+        pd.Timestamp(
+            latest["market_close"]
+        )
+        .tz_convert("UTC")
+    )
 
     return {
         "date": session_date,
@@ -107,29 +209,52 @@ def get_latest_completed_session(now=None):
     }
 
 
-def _download_intraday(ticker, interval):
-    """
-    Download recent intraday bars.
+# ============================================================
+# INTRADAY DATA
+# ============================================================
 
-    prepost=False is intentional, but we ALSO manually
-    filter to the official regular session below.
+def _download_intraday(
+    ticker,
+    interval,
+):
+    """
+    Download recent Yahoo intraday data.
+
+    prepost=False is requested.
+
+    We ALSO manually restrict timestamps to
+    the official regular trading session.
     """
 
-    df = yf.Ticker(ticker).history(
-        period="5d",
-        interval=interval,
-        auto_adjust=True,
-        actions=False,
-        prepost=False,
+    df = (
+        yf.Ticker(ticker)
+        .history(
+            period="5d",
+            interval=interval,
+            auto_adjust=True,
+            actions=False,
+            prepost=False,
+        )
     )
 
     if df.empty:
         return df
 
-    df = df[["Open", "Close"]].copy()
+    if (
+        "Open" not in df.columns
+        or
+        "Close" not in df.columns
+    ):
+        return pd.DataFrame()
 
-    # Force all intraday timestamps into UTC so that
-    # comparisons with official market open/close are exact.
+    df = df[
+        [
+            "Open",
+            "Close",
+        ]
+    ].copy()
+
+    # Convert timestamps to UTC.
     df.index = pd.to_datetime(
         df.index,
         utc=True,
@@ -146,76 +271,119 @@ def _build_daily_from_intraday(
     interval,
 ):
     """
-    Build today's daily Open/Close from regular-session
-    intraday bars only.
+    Reconstruct today's daily Open / Close
+    from REGULAR SESSION data only.
 
-    IMPORTANT:
+    Normal trading day:
 
     5m:
         Open  = 09:30 bar Open
-        Close = 15:55-16:00 bar Close
+        Close = 15:55 bar Close
 
     1m:
         Open  = 09:30 bar Open
-        Close = 15:59-16:00 bar Close
+        Close = 15:59 bar Close
 
-    On early-close days the expected final bar is calculated
-    from the official exchange close time automatically.
+    Early-close days are handled using the
+    official exchange calendar.
 
-    After-hours bars are NEVER used.
+    Premarket and after-hours prices are
+    never used.
     """
 
-    intraday = _download_intraday(
-        ticker,
-        interval,
+    intraday = (
+        _download_intraday(
+            ticker,
+            interval,
+        )
     )
 
     if intraday.empty:
         return None
 
-    market_open = session["market_open"]
-    market_close = session["market_close"]
+    market_open = (
+        session["market_open"]
+    )
+
+    market_close = (
+        session["market_close"]
+    )
 
     if interval == "5m":
+
         bar_length = pd.Timedelta(
             minutes=5
         )
 
     elif interval == "1m":
+
         bar_length = pd.Timedelta(
             minutes=1
         )
 
     else:
+
         raise ValueError(
-            f"Unsupported interval: {interval}"
+            f"Unsupported interval: "
+            f"{interval}"
         )
 
-    expected_first_bar = market_open
-
-    expected_last_bar = (
-        market_close - bar_length
+    expected_first_bar = (
+        market_open
     )
 
-    # Double protection:
-    # even though prepost=False was requested,
-    # manually discard everything outside RTH.
+    expected_last_bar = (
+        market_close
+        - bar_length
+    )
+
+    # --------------------------------------------------------
+    # Strictly filter to official regular trading hours.
+    #
+    # Anything before market open or at/after market close
+    # is discarded.
+    # --------------------------------------------------------
+
     regular = intraday[
-        (intraday.index >= market_open)
-        & (intraday.index < market_close)
+        (
+            intraday.index
+            >= market_open
+        )
+        &
+        (
+            intraday.index
+            < market_close
+        )
     ].copy()
 
     if regular.empty:
         return None
 
-    # We require the actual opening bar.
-    if expected_first_bar not in regular.index:
+    # --------------------------------------------------------
+    # Opening bar must exist.
+    # --------------------------------------------------------
+
+    if (
+        expected_first_bar
+        not in regular.index
+    ):
         return None
 
-    # We require the actual closing-session bar.
-    # This prevents a 15:30 price, for example,
-    # from being mistaken for the closing price.
-    if expected_last_bar not in regular.index:
+    # --------------------------------------------------------
+    # Closing bar must exist.
+    #
+    # This is important:
+    #
+    # We never use "the last available bar".
+    #
+    # We specifically require the bar that ends
+    # exactly at the official market close.
+    # --------------------------------------------------------
+
+    if (
+        expected_last_bar
+        not in regular.index
+    ):
         return None
 
     first_bar = regular.loc[
@@ -226,26 +394,37 @@ def _build_daily_from_intraday(
         expected_last_bar
     ]
 
-    open_price = float(
-        first_bar["Open"]
-    )
+    open_price = first_bar[
+        "Open"
+    ]
 
-    close_price = float(
-        last_bar["Close"]
-    )
+    close_price = last_bar[
+        "Close"
+    ]
 
-    if (
-        pd.isna(open_price)
-        or pd.isna(close_price)
+    if not (
+        _valid_price(open_price)
+        and
+        _valid_price(close_price)
     ):
         return None
 
     return {
-        "Open": open_price,
-        "Close": close_price,
-        "source": f"{interval}_fallback",
+        "Open": float(
+            open_price
+        ),
+        "Close": float(
+            close_price
+        ),
+        "source": (
+            f"{interval}_fallback"
+        ),
     }
 
+
+# ============================================================
+# DAILY HISTORY
+# ============================================================
 
 def load_daily_history(
     ticker,
@@ -253,78 +432,108 @@ def load_daily_history(
     session=None,
 ):
     """
-    Load historical daily prices and guarantee that the
-    latest completed trading session is included.
+    Download full daily history and guarantee
+    that the latest completed market session
+    has VALID Open and Close prices.
 
-    Source priority:
+    Priority:
 
-        1. Yahoo Daily
-        2. Regular-session 5m
-        3. Regular-session 1m
+        1. Valid Yahoo Daily
+        2. Complete regular-session 5m
+        3. Complete regular-session 1m
         4. Fail safely
 
-    Returns:
-        daily_df
-        latest_source
-        session
+    IMPORTANT:
+
+    Yahoo may publish today's date before
+    today's Daily OHLC fields are finished.
+
+    Therefore:
+
+        date exists
+
+    does NOT automatically mean:
+
+        Daily data is ready.
     """
 
     if session is None:
+
         session = (
             get_latest_completed_session()
         )
 
-    target_date = session["date"]
+    target_date = (
+        session["date"]
+    )
 
-    # Request through the day AFTER the desired session
-    # because Yahoo's `end` parameter is exclusive.
+    # Yahoo `end` is exclusive.
     end_date = (
         target_date
         + pd.Timedelta(days=1)
     )
 
     print(
-        f"Downloading {ticker} daily..."
+        f"Downloading "
+        f"{ticker} daily..."
     )
 
-    daily = yf.Ticker(ticker).history(
-        start=start_date,
-        end=end_date.strftime(
-            "%Y-%m-%d"
-        ),
-        interval="1d",
-        auto_adjust=True,
-        actions=False,
-        prepost=False,
+    daily = (
+        yf.Ticker(ticker)
+        .history(
+            start=start_date,
+            end=end_date.strftime(
+                "%Y-%m-%d"
+            ),
+            interval="1d",
+            auto_adjust=True,
+            actions=False,
+            prepost=False,
+        )
     )
 
     if daily.empty:
+
         raise RuntimeError(
-            f"No daily data returned for "
+            f"No daily data "
+            f"returned for "
             f"{ticker}"
         )
 
     if (
         "Open" not in daily.columns
-        or "Close" not in daily.columns
+        or
+        "Close" not in daily.columns
     ):
+
         raise RuntimeError(
-            f"Missing Open/Close for "
+            f"Missing Open/Close "
+            f"columns for "
             f"{ticker}"
         )
 
     daily = daily[
-        ["Open", "Close"]
+        [
+            "Open",
+            "Close",
+        ]
     ].copy()
 
-    daily = _normalize_daily_index(
-        daily
+    daily = (
+        _normalize_daily_index(
+            daily
+        )
     )
 
-    # --------------------------------------------------
-    # 1. DAILY already has the latest completed session
-    # --------------------------------------------------
-    if target_date in daily.index:
+    # ========================================================
+    # 1. VALID DAILY DATA
+    # ========================================================
+
+    if _daily_row_is_valid(
+        daily,
+        target_date,
+    ):
+
         print(
             f"✅ {ticker}: "
             f"{target_date.date()} "
@@ -337,13 +546,41 @@ def load_daily_history(
             session,
         )
 
-    # --------------------------------------------------
-    # 2. Try 5-minute RTH fallback
-    # --------------------------------------------------
+    # ========================================================
+    # Daily date exists but row is incomplete
+    # ========================================================
+
+    if target_date in daily.index:
+
+        print(
+            f"⚠️ {ticker}: "
+            f"daily row exists for "
+            f"{target_date.date()} "
+            f"but Open/Close is "
+            f"incomplete."
+        )
+
+        # Remove the bad temporary Yahoo row.
+        daily = daily.drop(
+            index=target_date
+        )
+
+    else:
+
+        print(
+            f"⚠️ {ticker}: "
+            f"daily missing "
+            f"{target_date.date()}."
+        )
+
+    # ========================================================
+    # 2. TRY 5-MINUTE REGULAR SESSION
+    # ========================================================
+
     print(
-        f"⚠️ {ticker}: daily missing "
-        f"{target_date.date()}, "
-        f"trying 5m..."
+        f"⚠️ {ticker}: "
+        f"trying 5m "
+        f"regular-session data..."
     )
 
     fallback = (
@@ -354,12 +591,16 @@ def load_daily_history(
         )
     )
 
-    # --------------------------------------------------
-    # 3. Try 1-minute RTH fallback
-    # --------------------------------------------------
+    # ========================================================
+    # 3. TRY 1-MINUTE REGULAR SESSION
+    # ========================================================
+
     if fallback is None:
+
         print(
-            f"⚠️ {ticker}: 5m unavailable, "
+            f"⚠️ {ticker}: "
+            f"5m unavailable or "
+            f"incomplete, "
             f"trying 1m..."
         )
 
@@ -371,23 +612,24 @@ def load_daily_history(
             )
         )
 
-    # --------------------------------------------------
-    # 4. Fail safely
-    # --------------------------------------------------
+    # ========================================================
+    # 4. FAIL SAFELY
+    # ========================================================
+
     if fallback is None:
+
         raise LatestSessionUnavailable(
             f"{ticker}: cannot obtain "
-            f"complete regular-session data "
-            f"for {target_date.date()} "
+            f"complete regular-session "
+            f"data for "
+            f"{target_date.date()} "
             f"from daily, 5m, or 1m."
         )
 
-    # Append a temporary daily row.
-    #
-    # On the next Action run, once Yahoo Daily contains
-    # this trading day, this temporary row is naturally
-    # replaced because the entire history is downloaded
-    # and recalculated from scratch.
+    # ========================================================
+    # Append temporary reconstructed daily row.
+    # ========================================================
+
     daily.loc[
         target_date,
         "Open",
@@ -398,12 +640,31 @@ def load_daily_history(
         "Close",
     ] = fallback["Close"]
 
-    daily = daily.sort_index()
+    daily = (
+        daily.sort_index()
+    )
+
+    # ========================================================
+    # Final safety check
+    # ========================================================
+
+    if not _daily_row_is_valid(
+        daily,
+        target_date,
+    ):
+
+        raise LatestSessionUnavailable(
+            f"{ticker}: reconstructed "
+            f"{target_date.date()} "
+            f"still has invalid "
+            f"Open/Close data."
+        )
 
     print(
         f"✅ {ticker}: "
         f"{target_date.date()} "
-        f"source={fallback['source']}"
+        f"source="
+        f"{fallback['source']}"
     )
 
     return (
