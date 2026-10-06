@@ -155,7 +155,7 @@ def build_current_status_record(summary_json: dict) -> dict:
         "SPY Cross Up": _to_bool(status["SPY Cross Up"]),
         "SPY Cross Down": _to_bool(status["SPY Cross Down"]),
         "Reason": status["Reason"],
-        "Last Updated": datetime.now(timezone.utc).date().isoformat(),
+        "Last Updated": datetime.now(timezone.utc).isoformat(),
         "Data Source": source_text,
     }
 

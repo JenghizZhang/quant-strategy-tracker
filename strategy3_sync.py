@@ -534,7 +534,10 @@ def values_equal(a: Any, b: Any) -> bool:
     b = normalize_scalar(b)
 
     if isinstance(a, float) and isinstance(b, float):
-        return abs(a - b) <= 1e-10
+        # Ignore tiny Yahoo historical adjusted-price drift.
+        # 1e-5 in return space = 0.001 percentage point,
+        # well below Notion's visible 0.01% precision.
+        return abs(a - b) <= 1e-5
 
     return a == b
 
@@ -826,8 +829,18 @@ def sync_current_status(
         actual,
         ignore_fields={"Last Updated"},
     ):
+        # Keep Last Updated consistent with Strategy 1 / 2:
+        # refresh the timestamp even when the market/status fields are unchanged.
+        update_page(
+            canonical["id"],
+            {
+                "Last Updated": prop_date(
+                    record["Last Updated"]
+                )
+            },
+        )
         print()
-        print("⏭️ Strategy 3 Current Status unchanged")
+        print("⏭️ Strategy 3 status unchanged; Last Updated refreshed")
     else:
         update_page(
             canonical["id"],
