@@ -1,663 +1,1538 @@
-from pathlib import Path
 import json
+import math
+import os
+import time
+import urllib.error
+import urllib.request
 
-import numpy as np
 import pandas as pd
+import pandas_market_calendars as mcal
 
-from market_data import (
-    get_latest_completed_session,
-    load_daily_history,
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+
+STRATEGY1_STATUS_DATA_SOURCE_ID = os.environ[
+    "STRATEGY1_STATUS_DATA_SOURCE_ID"
+]
+
+STRATEGY1_MONTHLY_DATA_SOURCE_ID = os.environ[
+    "STRATEGY1_MONTHLY_DATA_SOURCE_ID"
+]
+
+NOTION_VERSION = "2025-09-03"
+
+SUMMARY_FILE = "output/strategy1_summary.json"
+MONTHLY_FILE = "output/strategy1_monthly.csv"
+
+NYSE = mcal.get_calendar("NYSE")
+
+
+# ------------------------------------------------------------
+# Notion API write pacing
+# ------------------------------------------------------------
+
+WRITE_DELAY_SECONDS = 0.35
+
+
+# ------------------------------------------------------------
+# PERFORMANCE PRECISION
+#
+# Notion percentage fields store decimal values.
+#
+# Example:
+#
+# 0.02214202312929
+# =
+# 2.214202312929%
+#
+# We store:
+#
+# 0.022142
+# =
+# 2.2142%
+#
+# Backtest/CSV still keep full precision.
+# Only Notion presentation is rounded.
+# ------------------------------------------------------------
+
+PERFORMANCE_DECIMALS = 6
+
+NUMBER_TOLERANCE = (
+    0.5
+    * (10 ** -PERFORMANCE_DECIMALS)
 )
 
 
 # ============================================================
-# Strategy 1 — 双轨趋势
-#
-# Signal at today's CLOSE:
-#
-# 1. NDX Close > NDX MA30
-#       -> QQQ
-#
-# 2. NDX Close <= NDX MA30
-#    AND SPX MA50 > SPX MA200
-#       -> SPY
-#
-# 3. Otherwise
-#       -> AGG
-#
-# Execution:
-#       Next trading day's OPEN
-#
-# Transaction cost:
-#       0
-#
-# Backtest:
-#       From first trading day of 2016
-#
-# Latest market data priority:
-#       Daily
-#       -> 5m regular-session fallback
-#       -> 1m regular-session fallback
-#       -> Fail safely
+# NOTION API
 # ============================================================
 
-
-DOWNLOAD_START = "2014-01-01"
-BACKTEST_START = pd.Timestamp("2016-01-01")
-
-NDX = "^NDX"
-SPX = "^GSPC"
-
-ASSETS = [
-    "QQQ",
-    "SPY",
-    "AGG",
-]
-
-OUTPUT_DIR = Path("output")
-
-
-# ============================================================
-# SIGNALS
-# ============================================================
-
-def build_signals(ndx, spx):
-    """
-    Build Strategy 1 signals from daily closing data.
-    """
-
-    signals = pd.concat(
-        [
-            ndx["Close"].rename("NDX Close"),
-            spx["Close"].rename("SPX Close"),
-        ],
-        axis=1,
-        join="inner",
-    ).dropna()
-
-    # ----------------------------------------
-    # Nasdaq 100 MA30
-    # ----------------------------------------
-    signals["NDX MA30"] = (
-        signals["NDX Close"]
-        .rolling(
-            window=30,
-            min_periods=30,
-        )
-        .mean()
-    )
-
-    # ----------------------------------------
-    # S&P 500 MA50
-    # ----------------------------------------
-    signals["SPX MA50"] = (
-        signals["SPX Close"]
-        .rolling(
-            window=50,
-            min_periods=50,
-        )
-        .mean()
-    )
-
-    # ----------------------------------------
-    # S&P 500 MA200
-    # ----------------------------------------
-    signals["SPX MA200"] = (
-        signals["SPX Close"]
-        .rolling(
-            window=200,
-            min_periods=200,
-        )
-        .mean()
-    )
-
-    signals = signals.dropna().copy()
-
-    # ----------------------------------------
-    # Rule 1:
-    # NDX > MA30
-    # -> QQQ
-    # ----------------------------------------
-    condition_qqq = (
-        signals["NDX Close"]
-        > signals["NDX MA30"]
-    )
-
-    # ----------------------------------------
-    # Rule 2:
-    # NDX <= MA30
-    # AND
-    # SPX MA50 > MA200
-    # -> SPY
-    # ----------------------------------------
-    condition_spy = (
-        (~condition_qqq)
-        & (
-            signals["SPX MA50"]
-            > signals["SPX MA200"]
-        )
-    )
-
-    # ----------------------------------------
-    # Otherwise:
-    # -> AGG
-    # ----------------------------------------
-    signals["Signal"] = np.select(
-        [
-            condition_qqq,
-            condition_spy,
-        ],
-        [
-            "QQQ",
-            "SPY",
-        ],
-        default="AGG",
-    )
-
-    signals["Reason"] = np.select(
-        [
-            condition_qqq,
-            condition_spy,
-        ],
-        [
-            "NDX > MA30 → QQQ",
-            (
-                "NDX <= MA30 and "
-                "SPX MA50 > MA200 → SPY"
-            ),
-        ],
-        default=(
-            "NDX <= MA30 and "
-            "SPX MA50 <= MA200 → AGG"
-        ),
-    )
-
-    signals["NDX > MA30"] = (
-        condition_qqq
-    )
-
-    signals["SPX MA50 > MA200"] = (
-        signals["SPX MA50"]
-        > signals["SPX MA200"]
-    )
-
-    return signals
-
-
-# ============================================================
-# BACKTEST
-# ============================================================
-
-def run_backtest(
-    signals,
-    prices,
+def notion_request(
+    method,
+    path,
+    body=None,
 ):
     """
-    Strategy execution rule:
+    Make a Notion API request.
 
-        Signal is generated at today's CLOSE.
-
-        New position is entered at
-        NEXT trading day's OPEN.
-
-    Therefore:
-
-        Previous position receives:
-            previous close -> next open
-
-        New/current position receives:
-            next open -> next close
-
-    This avoids look-ahead bias.
+    The token is never printed.
     """
 
-    # ----------------------------------------
-    # Only use dates available across:
-    #
-    # NDX
-    # SPX
-    # QQQ
-    # SPY
-    # AGG
-    # ----------------------------------------
-    common_index = (
-        signals.index.copy()
+    url = (
+        "https://api.notion.com/v1/"
+        + path
     )
 
-    for ticker in ASSETS:
-        common_index = (
-            common_index.intersection(
-                prices[ticker].index
+    data = None
+
+    if body is not None:
+
+        data = json.dumps(
+            body
+        ).encode(
+            "utf-8"
+        )
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": (
+                f"Bearer {NOTION_TOKEN}"
+            ),
+            "Notion-Version": (
+                NOTION_VERSION
+            ),
+            "Content-Type": (
+                "application/json"
+            ),
+        },
+    )
+
+    try:
+
+        with urllib.request.urlopen(
+            request
+        ) as response:
+
+            text = (
+                response
+                .read()
+                .decode(
+                    "utf-8"
+                )
+            )
+
+            if not text:
+                return {}
+
+            return json.loads(
+                text
+            )
+
+    except urllib.error.HTTPError as e:
+
+        error_body = (
+            e.read()
+            .decode(
+                "utf-8",
+                errors="replace",
             )
         )
 
-    common_index = (
-        common_index.sort_values()
-    )
+        raise RuntimeError(
+            f"Notion API failed: "
+            f"HTTP {e.code} "
+            f"{e.reason}\n"
+            f"{error_body}"
+        ) from e
 
-    signals = signals.loc[
-        common_index
-    ].copy()
 
-    execution = pd.DataFrame(
-        index=common_index
-    )
+# ============================================================
+# QUERY ALL DATABASE ROWS
+# ============================================================
 
-    # ----------------------------------------
-    # Today's open executes yesterday's
-    # closing signal.
-    # ----------------------------------------
-    execution["Target"] = (
-        signals["Signal"].shift(1)
-    )
+def query_all_pages(
+    data_source_id,
+):
+    """
+    Query every row from a Notion data source.
 
-    execution["Reason"] = (
-        signals["Reason"].shift(1)
-    )
+    Handles pagination automatically.
+    """
 
-    execution["Signal Date"] = (
-        pd.Series(
-            common_index,
-            index=common_index,
+    pages = []
+
+    start_cursor = None
+
+    while True:
+
+        body = {
+            "page_size": 100,
+        }
+
+        if (
+            start_cursor
+            is not None
+        ):
+
+            body[
+                "start_cursor"
+            ] = start_cursor
+
+        result = notion_request(
+            "POST",
+            (
+                "data_sources/"
+                f"{data_source_id}"
+                "/query"
+            ),
+            body,
         )
-        .shift(1)
+
+        pages.extend(
+            result.get(
+                "results",
+                [],
+            )
+        )
+
+        has_more = result.get(
+            "has_more",
+            False,
+        )
+
+        if not has_more:
+            break
+
+        start_cursor = result.get(
+            "next_cursor"
+        )
+
+        if not start_cursor:
+            break
+
+    return pages
+
+
+# ============================================================
+# PROPERTY BUILDERS
+# ============================================================
+
+def notion_title(
+    value,
+):
+
+    return {
+        "title": [
+            {
+                "type": "text",
+                "text": {
+                    "content": str(
+                        value
+                    )
+                },
+            }
+        ]
+    }
+
+
+def notion_text(
+    value,
+):
+
+    return {
+        "rich_text": [
+            {
+                "type": "text",
+                "text": {
+                    "content": str(
+                        value
+                    )
+                },
+            }
+        ]
+    }
+
+
+def notion_select(
+    value,
+):
+
+    return {
+        "select": {
+            "name": str(
+                value
+            )
+        }
+    }
+
+
+def notion_number(
+    value,
+):
+    """
+    General numeric value.
+
+    Used for:
+    - NDX Close
+    - MA30
+    - MA50
+    - MA200
+
+    These retain full numeric precision.
+    """
+
+    return {
+        "number": float(
+            value
+        )
+    }
+
+
+def notion_performance_number(
+    value,
+):
+    """
+    Performance value written to Notion.
+
+    Example:
+
+        0.02214202312929
+        ->
+        0.022142
+
+    Notion percentage display:
+
+        2.2142%
+    """
+
+    return {
+        "number": round(
+            float(value),
+            PERFORMANCE_DECIMALS,
+        )
+    }
+
+
+def notion_checkbox(
+    value,
+):
+
+    return {
+        "checkbox": bool(
+            value
+        )
+    }
+
+
+def notion_date(
+    value,
+):
+
+    return {
+        "date": {
+            "start": str(
+                value
+            )
+        }
+    }
+
+
+# ============================================================
+# PROPERTY READERS
+# ============================================================
+
+def get_title_value(
+    page,
+    property_name,
+):
+
+    prop = (
+        page
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
-    # ----------------------------------------
-    # Start from 2016
-    # ----------------------------------------
-    execution = execution.loc[
-        execution.index
-        >= BACKTEST_START
-    ].copy()
+    title = prop.get(
+        "title",
+        [],
+    )
 
-    execution = (
-        execution.dropna(
-            subset=[
-                "Target",
-                "Signal Date",
+    if not title:
+        return None
+
+    parts = []
+
+    for item in title:
+
+        plain_text = item.get(
+            "plain_text"
+        )
+
+        if (
+            plain_text
+            is not None
+        ):
+
+            parts.append(
+                plain_text
+            )
+
+    return "".join(
+        parts
+    )
+
+
+def get_number_value(
+    page,
+    property_name,
+):
+
+    prop = (
+        page
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
+    )
+
+    return prop.get(
+        "number"
+    )
+
+
+def get_date_value(
+    page,
+    property_name,
+):
+
+    prop = (
+        page
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
+    )
+
+    date = prop.get(
+        "date"
+    )
+
+    if not date:
+        return None
+
+    return date.get(
+        "start"
+    )
+
+
+# ============================================================
+# NORMALIZATION / COMPARISON
+# ============================================================
+
+def normalize_performance(
+    value,
+):
+    """
+    Normalize performance to the exact precision
+    used by Notion.
+
+    This prevents tiny Yahoo historical
+    floating-point changes from causing
+    unnecessary rewrites.
+    """
+
+    return round(
+        float(value),
+        PERFORMANCE_DECIMALS,
+    )
+
+
+def numbers_equal(
+    current,
+    expected,
+):
+
+    if current is None:
+        return False
+
+    try:
+
+        current = float(
+            current
+        )
+
+        expected = float(
+            expected
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+
+        return False
+
+    if (
+        not math.isfinite(
+            current
+        )
+        or
+        not math.isfinite(
+            expected
+        )
+    ):
+
+        return False
+
+    return math.isclose(
+        current,
+        expected,
+        rel_tol=0,
+        abs_tol=NUMBER_TOLERANCE,
+    )
+
+
+def dates_equal(
+    current,
+    expected,
+):
+
+    if current is None:
+        return False
+
+    try:
+
+        current_date = (
+            pd.Timestamp(
+                current
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+        expected_date = (
+            pd.Timestamp(
+                expected
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+        return (
+            current_date
+            == expected_date
+        )
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# FIND CURRENT STATUS ROW
+# ============================================================
+
+def find_current_status_page():
+    """
+    Find the Current Status row:
+
+        Name = Strategy 1
+
+    We update the existing row.
+    """
+
+    result = notion_request(
+        "POST",
+        (
+            "data_sources/"
+            f"{STRATEGY1_STATUS_DATA_SOURCE_ID}"
+            "/query"
+        ),
+        {
+            "filter": {
+                "property": "Name",
+                "title": {
+                    "equals": (
+                        "Strategy 1"
+                    )
+                },
+            },
+            "page_size": 10,
+        },
+    )
+
+    pages = result.get(
+        "results",
+        [],
+    )
+
+    if len(pages) == 0:
+
+        raise RuntimeError(
+            "Could not find "
+            "'Strategy 1' row in "
+            "Current Status."
+        )
+
+    if len(pages) > 1:
+
+        raise RuntimeError(
+            "More than one row named "
+            "'Strategy 1' was found "
+            "in Current Status."
+        )
+
+    return pages[0]["id"]
+
+
+# ============================================================
+# NEXT TRADING DAY
+# ============================================================
+
+def get_next_trading_day(
+    signal_date,
+):
+    """
+    Signal:
+        today's close
+
+    Execution:
+        next actual US trading-day open
+
+    Handles:
+    - weekends
+    - holidays
+    """
+
+    signal_date = (
+        pd.Timestamp(
+            signal_date
+        )
+        .normalize()
+    )
+
+    start_date = (
+        signal_date
+        + pd.Timedelta(
+            days=1
+        )
+    )
+
+    end_date = (
+        signal_date
+        + pd.Timedelta(
+            days=14
+        )
+    )
+
+    schedule = NYSE.schedule(
+        start_date=(
+            start_date.date()
+        ),
+        end_date=(
+            end_date.date()
+        ),
+    )
+
+    if schedule.empty:
+
+        raise RuntimeError(
+            "Could not determine "
+            "next trading day."
+        )
+
+    return (
+        pd.Timestamp(
+            schedule.index[0]
+        )
+        .strftime(
+            "%Y-%m-%d"
+        )
+    )
+
+
+# ============================================================
+# DATA SOURCE DISPLAY
+# ============================================================
+
+def short_source_name(
+    source,
+):
+
+    mapping = {
+        "daily": "daily",
+        "5m_fallback": "5m",
+        "1m_fallback": "1m",
+    }
+
+    return mapping.get(
+        source,
+        source,
+    )
+
+
+def build_data_source_text(
+    data_sources,
+):
+    """
+    Examples:
+
+    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
+
+    Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
+    """
+
+    order = [
+        "NDX",
+        "SPX",
+        "QQQ",
+        "SPY",
+        "AGG",
+    ]
+
+    grouped = {}
+
+    for ticker in order:
+
+        source = (
+            short_source_name(
+                data_sources[
+                    ticker
+                ]
+            )
+        )
+
+        grouped.setdefault(
+            source,
+            [],
+        ).append(
+            ticker
+        )
+
+    parts = [
+        "Yahoo"
+    ]
+
+    for (
+        source,
+        tickers,
+    ) in grouped.items():
+
+        names = "/".join(
+            tickers
+        )
+
+        parts.append(
+            f"{names}: {source}"
+        )
+
+    return " | ".join(
+        parts
+    )
+
+
+# ============================================================
+# LOAD STRATEGY STATUS
+# ============================================================
+
+def load_strategy_output():
+
+    with open(
+        SUMMARY_FILE,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        payload = json.load(
+            f
+        )
+
+    if (
+        "current_status"
+        not in payload
+    ):
+
+        raise RuntimeError(
+            "strategy1_summary.json "
+            "does not contain "
+            "current_status."
+        )
+
+    return payload[
+        "current_status"
+    ]
+
+
+# ============================================================
+# SYNC CURRENT STATUS
+# ============================================================
+
+def sync_current_status():
+
+    status = (
+        load_strategy_output()
+    )
+
+    signal_date = status[
+        "Signal Date"
+    ]
+
+    execute_date = (
+        get_next_trading_day(
+            signal_date
+        )
+    )
+
+    data_source_text = (
+        build_data_source_text(
+            status[
+                "Data Sources"
             ]
         )
     )
 
-    if execution.empty:
-        raise RuntimeError(
-            "No backtest dates "
-            "available after 2016."
+    page_id = (
+        find_current_status_page()
+    )
+
+    last_updated = (
+        pd.Timestamp.now(
+            tz="UTC"
         )
+        .isoformat()
+    )
 
-    equity = 1.0
+    properties = {
 
-    holding = None
-    previous_date = None
-
-    daily_rows = []
-    position_history = []
-
-    for date, row in execution.iterrows():
-
-        target = row["Target"]
-        signal_date = row[
-            "Signal Date"
-        ]
-        reason = row["Reason"]
-
-        # ====================================
-        # First trading day
-        # ====================================
-
-        if previous_date is None:
-
-            old_holding = "CASH"
-
-            holding = target
-
-            open_price = (
-                prices[holding]
-                .at[
-                    date,
-                    "Open",
+        "Current Holding": (
+            notion_select(
+                status[
+                    "Current Holding"
                 ]
             )
-
-            close_price = (
-                prices[holding]
-                .at[
-                    date,
-                    "Close",
-                ]
-            )
-
-            # Start with $1 at the open.
-            equity *= (
-                close_price
-                / open_price
-            )
-
-            position_history.append(
-                {
-                    "Change": (
-                        f"{old_holding}"
-                        f" → "
-                        f"{holding}"
-                    ),
-                    "Signal Date": (
-                        signal_date
-                    ),
-                    "Execute Date": date,
-                    "From": old_holding,
-                    "To": holding,
-                    "Reason": reason,
-                }
-            )
-
-        # ====================================
-        # All later trading days
-        # ====================================
-
-        else:
-
-            # --------------------------------
-            # Overnight:
-            #
-            # yesterday close
-            # ->
-            # today open
-            #
-            # belongs to OLD position.
-            # --------------------------------
-
-            old_open = (
-                prices[holding]
-                .at[
-                    date,
-                    "Open",
-                ]
-            )
-
-            old_previous_close = (
-                prices[holding]
-                .at[
-                    previous_date,
-                    "Close",
-                ]
-            )
-
-            equity *= (
-                old_open
-                / old_previous_close
-            )
-
-            # --------------------------------
-            # Switch exactly at today's OPEN.
-            # --------------------------------
-
-            if target != holding:
-
-                old_holding = holding
-                holding = target
-
-                position_history.append(
-                    {
-                        "Change": (
-                            f"{old_holding}"
-                            f" → "
-                            f"{holding}"
-                        ),
-                        "Signal Date": (
-                            signal_date
-                        ),
-                        "Execute Date": (
-                            date
-                        ),
-                        "From": (
-                            old_holding
-                        ),
-                        "To": holding,
-                        "Reason": reason,
-                    }
-                )
-
-            # --------------------------------
-            # Today's open -> today's close
-            # belongs to NEW/current position.
-            # --------------------------------
-
-            current_open = (
-                prices[holding]
-                .at[
-                    date,
-                    "Open",
-                ]
-            )
-
-            current_close = (
-                prices[holding]
-                .at[
-                    date,
-                    "Close",
-                ]
-            )
-
-            equity *= (
-                current_close
-                / current_open
-            )
-
-        daily_rows.append(
-            {
-                "Date": date,
-                "Equity": equity,
-                "Holding": holding,
-                "Target": target,
-                "Signal Date": (
-                    signal_date
-                ),
-                "Signal Reason": (
-                    reason
-                ),
-            }
-        )
-
-        previous_date = date
-
-    daily = pd.DataFrame(
-        daily_rows
-    ).set_index("Date")
-
-    history = pd.DataFrame(
-        position_history
-    )
-
-    return (
-        daily,
-        history,
-    )
-
-
-# ============================================================
-# BENCHMARKS
-# ============================================================
-
-def buy_and_hold_equity(
-    price_df,
-    dates,
-):
-    """
-    Benchmark begins at the OPEN of
-    the same first backtest trading day.
-    """
-
-    first_date = dates[0]
-
-    initial_open = (
-        price_df.at[
-            first_date,
-            "Open",
-        ]
-    )
-
-    equity = (
-        price_df
-        .loc[
-            dates,
-            "Close",
-        ]
-        / initial_open
-    )
-
-    return equity
-
-
-# ============================================================
-# MONTHLY / ANNUAL PERFORMANCE
-# ============================================================
-
-def calculate_period_returns(
-    equity,
-    period,
-):
-
-    if period == "month":
-
-        end_values = (
-            equity.groupby(
-                equity.index.to_period(
-                    "M"
-                )
-            )
-            .last()
-        )
-
-    elif period == "year":
-
-        end_values = (
-            equity.groupby(
-                equity.index.year
-            )
-            .last()
-        )
-
-    else:
-        raise ValueError(
-            f"Unknown period: "
-            f"{period}"
-        )
-
-    returns = (
-        end_values.pct_change()
-    )
-
-    # ----------------------------------------
-    # First period starts from initial
-    # equity = 1.
-    # ----------------------------------------
-    returns.iloc[0] = (
-        end_values.iloc[0]
-        - 1.0
-    )
-
-    return returns
-
-
-# ============================================================
-# SUMMARY METRICS
-# ============================================================
-
-def calculate_metrics(
-    equity,
-):
-
-    latest_year = (
-        equity.index[-1].year
-    )
-
-    # ----------------------------------------
-    # YTD base:
-    # last trading day of prior year
-    # ----------------------------------------
-    prior_year_values = equity[
-        equity.index.year
-        < latest_year
-    ]
-
-    if len(prior_year_values) > 0:
-        ytd_base = (
-            prior_year_values.iloc[-1]
-        )
-    else:
-        ytd_base = 1.0
-
-    ytd_return = (
-        equity.iloc[-1]
-        / ytd_base
-    ) - 1.0
-
-    # ----------------------------------------
-    # Total return since start
-    # ----------------------------------------
-    since_2016 = (
-        equity.iloc[-1]
-        - 1.0
-    )
-
-    # ----------------------------------------
-    # CAGR
-    # ----------------------------------------
-    years = (
-        (
-            equity.index[-1]
-            - equity.index[0]
-        ).days
-        / 365.25
-    )
-
-    if years > 0:
-
-        cagr = (
-            equity.iloc[-1]
-            ** (1 / years)
-        ) - 1.0
-
-    else:
-
-        cagr = 0.0
-
-    # ----------------------------------------
-    # Max Drawdown
-    # ----------------------------------------
-    running_max = (
-        equity.cummax()
-    )
-
-    drawdown = (
-        equity
-        / running_max
-    ) - 1.0
-
-    max_drawdown = (
-        drawdown.min()
-    )
-
-    return {
-        "YTD Return": float(
-            ytd_return
         ),
-        "Since 2016": float(
-            since_2016
+
+        "Today's Signal": (
+            notion_select(
+                status[
+                    "Today's Signal"
+                ]
+            )
         ),
-        "CAGR": float(
-            cagr
+
+        "Next Holding": (
+            notion_select(
+                status[
+                    "Next Holding"
+                ]
+            )
         ),
-        "Max Drawdown": float(
-            max_drawdown
+
+        "Signal Date": (
+            notion_date(
+                signal_date
+            )
+        ),
+
+        "Execute Date": (
+            notion_date(
+                execute_date
+            )
+        ),
+
+        "NDX Close": (
+            notion_number(
+                status[
+                    "NDX Close"
+                ]
+            )
+        ),
+
+        "NDX MA30": (
+            notion_number(
+                status[
+                    "NDX MA30"
+                ]
+            )
+        ),
+
+        "NDX > MA30": (
+            notion_checkbox(
+                status[
+                    "NDX > MA30"
+                ]
+            )
+        ),
+
+        "SPX MA50": (
+            notion_number(
+                status[
+                    "SPX MA50"
+                ]
+            )
+        ),
+
+        "SPX MA200": (
+            notion_number(
+                status[
+                    "SPX MA200"
+                ]
+            )
+        ),
+
+        "SPX MA50 > MA200": (
+            notion_checkbox(
+                status[
+                    "SPX MA50 > MA200"
+                ]
+            )
+        ),
+
+        "Reason": (
+            notion_text(
+                status[
+                    "Reason"
+                ]
+            )
+        ),
+
+        "Last Updated": (
+            notion_date(
+                last_updated
+            )
+        ),
+
+        "Data Source": (
+            notion_text(
+                data_source_text
+            )
         ),
     }
 
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": (
+                properties
+            )
+        },
+    )
 
-def percent(value):
-    return (
-        f"{value * 100:.2f}%"
+    print()
+    print("=" * 70)
+    print(
+        "NOTION CURRENT STATUS"
+    )
+    print("=" * 70)
+
+    print(
+        "Name            :",
+        "Strategy 1",
+    )
+
+    print(
+        "Signal Date     :",
+        signal_date,
+    )
+
+    print(
+        "Execute Date    :",
+        execute_date,
+    )
+
+    print(
+        "Current Holding :",
+        status[
+            "Current Holding"
+        ],
+    )
+
+    print(
+        "Today's Signal  :",
+        status[
+            "Today's Signal"
+        ],
+    )
+
+    print(
+        "Next Holding    :",
+        status[
+            "Next Holding"
+        ],
+    )
+
+    print(
+        "Data Source     :",
+        data_source_text,
+    )
+
+    print()
+
+    print(
+        "✅ Strategy 1 Current Status "
+        "updated in Notion"
+    )
+
+
+# ============================================================
+# LOAD MONTHLY PERFORMANCE
+# ============================================================
+
+def load_monthly_results():
+    """
+    Read:
+
+        output/strategy1_monthly.csv
+
+    Expected columns:
+
+        Month
+        Strategy 1
+        QQQ
+        SPY
+    """
+
+    monthly = pd.read_csv(
+        MONTHLY_FILE,
+        dtype={
+            "Month": str,
+        },
+    )
+
+    required_columns = {
+        "Month",
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    }
+
+    missing = (
+        required_columns
+        - set(
+            monthly.columns
+        )
+    )
+
+    if missing:
+
+        raise RuntimeError(
+            "Monthly CSV missing "
+            "required column(s): "
+            + ", ".join(
+                sorted(
+                    missing
+                )
+            )
+        )
+
+    monthly = monthly[
+        [
+            "Month",
+            "Strategy 1",
+            "QQQ",
+            "SPY",
+        ]
+    ].copy()
+
+    monthly = (
+        monthly.sort_values(
+            "Month"
+        )
+    )
+
+    for column in [
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    ]:
+
+        if monthly[
+            column
+        ].isna().any():
+
+            bad_months = (
+                monthly.loc[
+                    monthly[
+                        column
+                    ].isna(),
+                    "Month",
+                ]
+                .tolist()
+            )
+
+            raise RuntimeError(
+                f"Monthly CSV contains "
+                f"NaN in {column}: "
+                f"{bad_months}"
+            )
+
+    # --------------------------------------------------------
+    # Normalize only the values that will be synced to Notion.
+    # --------------------------------------------------------
+
+    monthly[
+        "Strategy 1"
+    ] = (
+        monthly[
+            "Strategy 1"
+        ]
+        .map(
+            normalize_performance
+        )
+    )
+
+    monthly[
+        "QQQ"
+    ] = (
+        monthly[
+            "QQQ"
+        ]
+        .map(
+            normalize_performance
+        )
+    )
+
+    monthly[
+        "SPY"
+    ] = (
+        monthly[
+            "SPY"
+        ]
+        .map(
+            normalize_performance
+        )
+    )
+
+    return monthly
+
+
+# ============================================================
+# EXISTING MONTHLY ROWS
+# ============================================================
+
+def get_existing_month_rows():
+    """
+    Return:
+
+        {
+            "2026-10": page,
+            "2026-09": page,
+            ...
+        }
+
+    Duplicate Month rows are treated as an error.
+    """
+
+    pages = query_all_pages(
+        STRATEGY1_MONTHLY_DATA_SOURCE_ID
+    )
+
+    result = {}
+
+    for page in pages:
+
+        month = (
+            get_title_value(
+                page,
+                "Month",
+            )
+        )
+
+        if not month:
+            continue
+
+        if month in result:
+
+            raise RuntimeError(
+                "Duplicate Monthly "
+                "Performance row found: "
+                f"{month}"
+            )
+
+        result[
+            month
+        ] = page
+
+    return result
+
+
+# ============================================================
+# CREATE MONTHLY ROW
+# ============================================================
+
+def create_month_row(
+    month,
+    month_start,
+    strategy_return,
+    qqq_return,
+    spy_return,
+):
+    """
+    Automatically used when a new month appears
+    and the Notion row does not exist yet.
+    """
+
+    return notion_request(
+        "POST",
+        "pages",
+        {
+            "parent": {
+                "type": (
+                    "data_source_id"
+                ),
+                "data_source_id": (
+                    STRATEGY1_MONTHLY_DATA_SOURCE_ID
+                ),
+            },
+
+            "properties": {
+
+                "Month": (
+                    notion_title(
+                        month
+                    )
+                ),
+
+                "Month Start": (
+                    notion_date(
+                        month_start
+                    )
+                ),
+
+                "Strategy 1": (
+                    notion_performance_number(
+                        strategy_return
+                    )
+                ),
+
+                "QQQ": (
+                    notion_performance_number(
+                        qqq_return
+                    )
+                ),
+
+                "SPY": (
+                    notion_performance_number(
+                        spy_return
+                    )
+                ),
+            },
+        },
+    )
+
+
+# ============================================================
+# UPDATE MONTHLY ROW
+# ============================================================
+
+def update_month_row(
+    page_id,
+    month_start,
+    strategy_return,
+    qqq_return,
+    spy_return,
+):
+
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": {
+
+                "Month Start": (
+                    notion_date(
+                        month_start
+                    )
+                ),
+
+                "Strategy 1": (
+                    notion_performance_number(
+                        strategy_return
+                    )
+                ),
+
+                "QQQ": (
+                    notion_performance_number(
+                        qqq_return
+                    )
+                ),
+
+                "SPY": (
+                    notion_performance_number(
+                        spy_return
+                    )
+                ),
+            }
+        },
+    )
+
+
+# ============================================================
+# SYNC MONTHLY PERFORMANCE
+# ============================================================
+
+def sync_monthly_performance():
+
+    print()
+    print("=" * 70)
+    print(
+        "NOTION MONTHLY PERFORMANCE"
+    )
+    print("=" * 70)
+
+    monthly = (
+        load_monthly_results()
+    )
+
+    existing = (
+        get_existing_month_rows()
+    )
+
+    updated = 0
+    created = 0
+    unchanged = 0
+
+    for _, row in (
+        monthly.iterrows()
+    ):
+
+        month = str(
+            row["Month"]
+        )
+
+        month_start = (
+            pd.Timestamp(
+                f"{month}-01"
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
+        )
+
+        strategy_return = (
+            normalize_performance(
+                row[
+                    "Strategy 1"
+                ]
+            )
+        )
+
+        qqq_return = (
+            normalize_performance(
+                row["QQQ"]
+            )
+        )
+
+        spy_return = (
+            normalize_performance(
+                row["SPY"]
+            )
+        )
+
+        # ====================================================
+        # CREATE NEW MONTH
+        # ====================================================
+
+        if (
+            month
+            not in existing
+        ):
+
+            create_month_row(
+                month=month,
+
+                month_start=(
+                    month_start
+                ),
+
+                strategy_return=(
+                    strategy_return
+                ),
+
+                qqq_return=(
+                    qqq_return
+                ),
+
+                spy_return=(
+                    spy_return
+                ),
+            )
+
+            created += 1
+
+            print(
+                f"➕ {month}: created"
+            )
+
+            time.sleep(
+                WRITE_DELAY_SECONDS
+            )
+
+            continue
+
+        # ====================================================
+        # EXISTING MONTH
+        # ====================================================
+
+        page = existing[
+            month
+        ]
+
+        current_month_start = (
+            get_date_value(
+                page,
+                "Month Start",
+            )
+        )
+
+        current_strategy = (
+            get_number_value(
+                page,
+                "Strategy 1",
+            )
+        )
+
+        current_qqq = (
+            get_number_value(
+                page,
+                "QQQ",
+            )
+        )
+
+        current_spy = (
+            get_number_value(
+                page,
+                "SPY",
+            )
+        )
+
+        is_same = (
+
+            dates_equal(
+                current_month_start,
+                month_start,
+            )
+
+            and
+
+            numbers_equal(
+                current_strategy,
+                strategy_return,
+            )
+
+            and
+
+            numbers_equal(
+                current_qqq,
+                qqq_return,
+            )
+
+            and
+
+            numbers_equal(
+                current_spy,
+                spy_return,
+            )
+        )
+
+        # ====================================================
+        # NOTHING CHANGED
+        # ====================================================
+
+        if is_same:
+
+            unchanged += 1
+
+            continue
+
+        # ====================================================
+        # UPDATE CHANGED MONTH
+        # ====================================================
+
+        update_month_row(
+            page_id=(
+                page["id"]
+            ),
+
+            month_start=(
+                month_start
+            ),
+
+            strategy_return=(
+                strategy_return
+            ),
+
+            qqq_return=(
+                qqq_return
+            ),
+
+            spy_return=(
+                spy_return
+            ),
+        )
+
+        updated += 1
+
+        print(
+            f"✏️ {month}: updated"
+        )
+
+        time.sleep(
+            WRITE_DELAY_SECONDS
+        )
+
+    print()
+
+    print(
+        "Monthly rows in backtest :",
+        len(
+            monthly
+        ),
+    )
+
+    print(
+        "Updated                  :",
+        updated,
+    )
+
+    print(
+        "Created                  :",
+        created,
+    )
+
+    print(
+        "Unchanged                :",
+        unchanged,
+    )
+
+    print()
+
+    print(
+        "✅ Strategy 1 Monthly "
+        "Performance synced to Notion"
     )
 
 
@@ -667,642 +1542,32 @@ def percent(value):
 
 def main():
 
+    print(
+        "Syncing Strategy 1 "
+        "to Notion..."
+    )
+
+    # --------------------------------------------------------
+    # 1. Current Status
+    # --------------------------------------------------------
+
+    sync_current_status()
+
+    # --------------------------------------------------------
+    # 2. Monthly Performance
+    # --------------------------------------------------------
+
+    sync_monthly_performance()
+
+    print()
     print("=" * 70)
-    print(
-        "Strategy 1 — 双轨趋势"
-    )
-    print("=" * 70)
-
-    # ========================================================
-    # Identify latest COMPLETED market session
-    # ========================================================
-
-    session = (
-        get_latest_completed_session()
-    )
-
-    target_date = (
-        session["date"]
-    )
-
-    print()
-
-    print(
-        "Latest completed "
-        "market session:",
-        target_date.date(),
-    )
-
-    print()
-
-    # ========================================================
-    # DOWNLOAD MARKET DATA
-    # ========================================================
-
-    ndx, ndx_source, _ = (
-        load_daily_history(
-            NDX,
-            DOWNLOAD_START,
-            session=session,
-        )
-    )
-
-    spx, spx_source, _ = (
-        load_daily_history(
-            SPX,
-            DOWNLOAD_START,
-            session=session,
-        )
-    )
-
-    prices = {}
-    price_sources = {}
-
-    for ticker in ASSETS:
-
-        df, source, _ = (
-            load_daily_history(
-                ticker,
-                DOWNLOAD_START,
-                session=session,
-            )
-        )
-
-        prices[ticker] = df
-
-        price_sources[
-            ticker
-        ] = source
-
-    # ========================================================
-    # BUILD SIGNALS
-    # ========================================================
-
-    signals = build_signals(
-        ndx,
-        spx,
-    )
-
-    # ========================================================
-    # RUN STRATEGY
-    # ========================================================
-
-    (
-        strategy_daily,
-        position_history,
-    ) = run_backtest(
-        signals,
-        prices,
-    )
-
-    dates = (
-        strategy_daily.index
-    )
-
-    # ========================================================
-    # CRITICAL FRESHNESS CHECK
-    #
-    # Never silently use yesterday's data
-    # as today's current status.
-    # ========================================================
-
-    if dates[-1] != target_date:
-
-        raise RuntimeError(
-            "Backtest did not reach "
-            "the latest completed "
-            "market session. "
-            f"Expected "
-            f"{target_date.date()}, "
-            f"got "
-            f"{dates[-1].date()}."
-        )
-
-    strategy_equity = (
-        strategy_daily["Equity"]
-    )
-
-    # ========================================================
-    # BENCHMARKS
-    # ========================================================
-
-    qqq_equity = (
-        buy_and_hold_equity(
-            prices["QQQ"],
-            dates,
-        )
-    )
-
-    spy_equity = (
-        buy_and_hold_equity(
-            prices["SPY"],
-            dates,
-        )
-    )
-
-    # ========================================================
-    # MONTHLY PERFORMANCE
-    # ========================================================
-
-    monthly = pd.DataFrame(
-        {
-            "Strategy 1": (
-                calculate_period_returns(
-                    strategy_equity,
-                    "month",
-                )
-            ),
-            "QQQ": (
-                calculate_period_returns(
-                    qqq_equity,
-                    "month",
-                )
-            ),
-            "SPY": (
-                calculate_period_returns(
-                    spy_equity,
-                    "month",
-                )
-            ),
-        }
-    )
-
-    monthly.index = (
-        monthly.index.astype(str)
-    )
-
-    monthly.index.name = "Month"
-
-    # ========================================================
-    # ANNUAL PERFORMANCE
-    # ========================================================
-
-    annual = pd.DataFrame(
-        {
-            "Strategy 1": (
-                calculate_period_returns(
-                    strategy_equity,
-                    "year",
-                )
-            ),
-            "QQQ": (
-                calculate_period_returns(
-                    qqq_equity,
-                    "year",
-                )
-            ),
-            "SPY": (
-                calculate_period_returns(
-                    spy_equity,
-                    "year",
-                )
-            ),
-        }
-    )
-
-    annual.index.name = "Year"
-
-    # ========================================================
-    # OVERALL SUMMARY
-    # ========================================================
-
-    summary = {
-        "Strategy 1": (
-            calculate_metrics(
-                strategy_equity
-            )
-        ),
-        "QQQ": (
-            calculate_metrics(
-                qqq_equity
-            )
-        ),
-        "SPY": (
-            calculate_metrics(
-                spy_equity
-            )
-        ),
-    }
-
-    # ========================================================
-    # CURRENT STATUS
-    # ========================================================
-
-    latest_date = (
-        dates[-1]
-    )
-
-    # ----------------------------------------
-    # Position actually held during today's
-    # trading session.
-    # ----------------------------------------
-    current_holding = (
-        strategy_daily
-        .iloc[-1]["Holding"]
-    )
-
-    # ----------------------------------------
-    # Today's closing signal.
-    #
-    # This is what should be held starting
-    # NEXT trading day's open.
-    # ----------------------------------------
-    today_signal = (
-        signals.at[
-            latest_date,
-            "Signal",
-        ]
-    )
-
-    next_holding = (
-        today_signal
-    )
-
-    pending_change = (
-        current_holding
-        != next_holding
-    )
-
-    current_status = {
-
-        "Data Date": str(
-            latest_date.date()
-        ),
-
-        "Signal Date": str(
-            latest_date.date()
-        ),
-
-        "Current Holding": (
-            current_holding
-        ),
-
-        "Today's Signal": (
-            today_signal
-        ),
-
-        "Next Holding": (
-            next_holding
-        ),
-
-        "Pending Change": (
-            pending_change
-        ),
-
-        "NDX Close": float(
-            signals.at[
-                latest_date,
-                "NDX Close",
-            ]
-        ),
-
-        "NDX MA30": float(
-            signals.at[
-                latest_date,
-                "NDX MA30",
-            ]
-        ),
-
-        "NDX > MA30": bool(
-            signals.at[
-                latest_date,
-                "NDX > MA30",
-            ]
-        ),
-
-        "SPX MA50": float(
-            signals.at[
-                latest_date,
-                "SPX MA50",
-            ]
-        ),
-
-        "SPX MA200": float(
-            signals.at[
-                latest_date,
-                "SPX MA200",
-            ]
-        ),
-
-        "SPX MA50 > MA200": bool(
-            signals.at[
-                latest_date,
-                "SPX MA50 > MA200",
-            ]
-        ),
-
-        "Reason": (
-            signals.at[
-                latest_date,
-                "Reason",
-            ]
-        ),
-
-        "Data Sources": {
-
-            "NDX": (
-                ndx_source
-            ),
-
-            "SPX": (
-                spx_source
-            ),
-
-            **price_sources,
-        },
-    }
-
-    # ========================================================
-    # SAVE RESULTS
-    # ========================================================
-
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    strategy_daily.to_csv(
-        OUTPUT_DIR
-        / "strategy1_daily.csv"
-    )
-
-    monthly.to_csv(
-        OUTPUT_DIR
-        / "strategy1_monthly.csv"
-    )
-
-    annual.to_csv(
-        OUTPUT_DIR
-        / "strategy1_annual.csv"
-    )
-
-    position_history.to_csv(
-        OUTPUT_DIR
-        / (
-            "strategy1_"
-            "position_history.csv"
-        ),
-        index=False,
-    )
-
-    with open(
-        OUTPUT_DIR
-        / "strategy1_summary.json",
-        "w",
-        encoding="utf-8",
-    ) as f:
-
-        json.dump(
-            {
-                "summary": summary,
-                "current_status": (
-                    current_status
-                ),
-            },
-            f,
-            indent=2,
-            ensure_ascii=False,
-        )
-
-    # ========================================================
-    # CONSOLE OUTPUT
-    # ========================================================
-
-    print()
-
-    print(
-        "BACKTEST PERIOD"
-    )
-
-    print(
-        f"{dates[0].date()}"
-        f" → "
-        f"{dates[-1].date()}"
-    )
-
-    # ========================================================
-    # DATA SOURCES
-    # ========================================================
-
-    print()
-
-    print("=" * 70)
-    print("DATA SOURCES")
-    print("=" * 70)
-
-    print(
-        f"NDX : "
-        f"{ndx_source}"
-    )
-
-    print(
-        f"SPX : "
-        f"{spx_source}"
-    )
-
-    for ticker in ASSETS:
-
-        print(
-            f"{ticker:<3} : "
-            f"{price_sources[ticker]}"
-        )
-
-    # ========================================================
-    # CURRENT STATUS
-    # ========================================================
-
-    print()
-
-    print("=" * 70)
-    print("CURRENT STATUS")
-    print("=" * 70)
-
-    print(
-        "Data Date       :",
-        latest_date.date(),
-    )
-
-    print(
-        "Current Holding :",
-        current_holding,
-    )
-
-    print(
-        "Today's Signal  :",
-        today_signal,
-    )
-
-    print(
-        "Next Holding    :",
-        next_holding,
-    )
-
-    print(
-        "Pending Change  :",
-        (
-            "YES"
-            if pending_change
-            else "NO"
-        ),
-    )
-
-    print()
-
-    print(
-        f"NDX Close       : "
-        f"{current_status['NDX Close']:.2f}"
-    )
-
-    print(
-        f"NDX MA30        : "
-        f"{current_status['NDX MA30']:.2f}"
-    )
-
-    print(
-        "NDX > MA30      :",
-        current_status[
-            "NDX > MA30"
-        ],
-    )
-
-    print()
-
-    print(
-        f"SPX MA50        : "
-        f"{current_status['SPX MA50']:.2f}"
-    )
-
-    print(
-        f"SPX MA200       : "
-        f"{current_status['SPX MA200']:.2f}"
-    )
-
-    print(
-        "MA50 > MA200    :",
-        current_status[
-            "SPX MA50 > MA200"
-        ],
-    )
-
-    print()
-
-    print(
-        "Reason           :",
-        current_status["Reason"],
-    )
-
-    # ========================================================
-    # SUMMARY
-    # ========================================================
-
-    print()
-
-    print("=" * 70)
-    print("SUMMARY")
-    print("=" * 70)
-
-    for name, metrics in (
-        summary.items()
-    ):
-
-        print()
-        print(name)
-
-        print(
-            "  YTD Return    :",
-            percent(
-                metrics[
-                    "YTD Return"
-                ]
-            ),
-        )
-
-        print(
-            "  Since 2016    :",
-            percent(
-                metrics[
-                    "Since 2016"
-                ]
-            ),
-        )
-
-        print(
-            "  CAGR          :",
-            percent(
-                metrics[
-                    "CAGR"
-                ]
-            ),
-        )
-
-        print(
-            "  Max Drawdown  :",
-            percent(
-                metrics[
-                    "Max Drawdown"
-                ]
-            ),
-        )
-
-    # ========================================================
-    # LATEST 12 MONTHS
-    # ========================================================
-
-    print()
-
-    print("=" * 70)
-    print("LATEST 12 MONTHS")
-    print("=" * 70)
-
-    print(
-        monthly
-        .tail(12)
-        .to_string(
-            float_format=(
-                lambda x: (
-                    f"{x * 100:.2f}%"
-                )
-            )
-        )
-    )
-
-    # ========================================================
-    # ANNUAL RETURNS
-    # ========================================================
-
-    print()
-
-    print("=" * 70)
-    print("ANNUAL RETURNS")
-    print("=" * 70)
-
-    print(
-        annual.to_string(
-            float_format=(
-                lambda x: (
-                    f"{x * 100:.2f}%"
-                )
-            )
-        )
-    )
-
-    # ========================================================
-    # POSITION HISTORY
-    # ========================================================
-
-    print()
-
-    print(
-        f"Position changes: "
-        f"{len(position_history)}"
-    )
-
-    print()
 
     print(
         "✅ Strategy 1 "
-        "backtest completed"
+        "Notion sync completed"
     )
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
