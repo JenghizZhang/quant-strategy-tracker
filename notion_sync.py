@@ -35,6 +35,10 @@ CURRENT_POSITIONS_DATA_SOURCE_ID = os.environ[
     "CURRENT_POSITIONS_DATA_SOURCE_ID"
 ]
 
+STRATEGY_OVERVIEW_DATA_SOURCE_ID = os.environ[
+    "STRATEGY_OVERVIEW_DATA_SOURCE_ID"
+]
+
 
 NOTION_VERSION = "2025-09-03"
 
@@ -47,7 +51,6 @@ NYSE = mcal.get_calendar("NYSE")
 
 WRITE_DELAY_SECONDS = 0.35
 
-# Re-check recent position changes in case Yahoo later repairs data.
 HISTORY_REPAIR_DAYS = 45
 
 
@@ -58,8 +61,9 @@ HISTORY_REPAIR_DAYS = 45
 #
 # 0.022210 = 2.2210%
 #
-# Six stored decimal places therefore gives
-# four decimal places in the percentage display.
+# 6 storage decimal places
+# =
+# 4 displayed percentage decimal places
 # ============================================================
 
 PERFORMANCE_STORAGE_DECIMALS = 6
@@ -115,7 +119,9 @@ def notion_request(
             text = (
                 response
                 .read()
-                .decode("utf-8")
+                .decode(
+                    "utf-8"
+                )
             )
 
             if not text:
@@ -146,10 +152,6 @@ def notion_request(
 def query_all_pages(
     data_source_id,
 ):
-    """
-    Read every row from a Notion data source.
-    """
-
     pages = []
 
     start_cursor = None
@@ -531,10 +533,10 @@ def dates_equal(
 
 
 # ============================================================
-# LOAD STRATEGY STATUS
+# LOAD STRATEGY JSON
 # ============================================================
 
-def load_strategy_output():
+def load_strategy_payload():
     with open(
         SUMMARY_FILE,
         "r",
@@ -555,9 +557,32 @@ def load_strategy_output():
             "current_status."
         )
 
-    return payload[
-        "current_status"
-    ]
+    if (
+        "summary"
+        not in payload
+    ):
+        raise RuntimeError(
+            "strategy1_summary.json "
+            "does not contain summary."
+        )
+
+    return payload
+
+
+def load_strategy_output():
+    return (
+        load_strategy_payload()[
+            "current_status"
+        ]
+    )
+
+
+def load_strategy_summary():
+    return (
+        load_strategy_payload()[
+            "summary"
+        ]
+    )
 
 
 # ============================================================
@@ -868,17 +893,13 @@ def sync_current_status():
         "PATCH",
         f"pages/{page_id}",
         {
-            "properties": (
-                properties
-            )
+            "properties": properties
         },
     )
 
     print()
     print("=" * 70)
-    print(
-        "NOTION CURRENT STATUS"
-    )
+    print("NOTION CURRENT STATUS")
     print("=" * 70)
 
     print(
@@ -935,13 +956,6 @@ def sync_current_status():
 # ============================================================
 
 def find_main_current_position_page():
-    """
-    Find Strategy 1 row in the main
-    Current Positions database.
-
-    Strategy 2 and Strategy 3 are untouched.
-    """
-
     result = notion_request(
         "POST",
         (
@@ -987,11 +1001,6 @@ def find_main_current_position_page():
 
 
 def sync_main_current_positions():
-    """
-    Update only Strategy 1 on the
-    main Quant Strategy page.
-    """
-
     status = (
         load_strategy_output()
     )
@@ -1066,9 +1075,7 @@ def sync_main_current_positions():
         "PATCH",
         f"pages/{page_id}",
         {
-            "properties": (
-                properties
-            )
+            "properties": properties
         },
     )
 
@@ -1120,6 +1127,259 @@ def sync_main_current_positions():
     print(
         "✅ Main Current Positions "
         "Strategy 1 updated in Notion"
+    )
+
+
+# ============================================================
+# MAIN PAGE — STRATEGY OVERVIEW
+# ============================================================
+
+def find_strategy_overview_page(
+    name,
+):
+    result = notion_request(
+        "POST",
+        (
+            "data_sources/"
+            f"{STRATEGY_OVERVIEW_DATA_SOURCE_ID}"
+            "/query"
+        ),
+        {
+            "filter": {
+                "property": "Name",
+                "title": {
+                    "equals": name
+                },
+            },
+            "page_size": 10,
+        },
+    )
+
+    pages = result.get(
+        "results",
+        [],
+    )
+
+    if len(pages) == 0:
+        raise RuntimeError(
+            f"Could not find "
+            f"'{name}' row in "
+            f"Strategy Overview."
+        )
+
+    if len(pages) > 1:
+        raise RuntimeError(
+            f"More than one "
+            f"'{name}' row found in "
+            f"Strategy Overview."
+        )
+
+    return pages[0]
+
+
+def strategy_overview_matches(
+    page,
+    metrics,
+):
+    return (
+
+        numbers_equal(
+            get_number_value(
+                page,
+                "YTD Return",
+            ),
+            normalize_performance(
+                metrics[
+                    "YTD Return"
+                ]
+            ),
+        )
+
+        and
+
+        numbers_equal(
+            get_number_value(
+                page,
+                "Since 2016",
+            ),
+            normalize_performance(
+                metrics[
+                    "Since 2016"
+                ]
+            ),
+        )
+
+        and
+
+        numbers_equal(
+            get_number_value(
+                page,
+                "CAGR",
+            ),
+            normalize_performance(
+                metrics[
+                    "CAGR"
+                ]
+            ),
+        )
+
+        and
+
+        numbers_equal(
+            get_number_value(
+                page,
+                "Max Drawdown",
+            ),
+            normalize_performance(
+                metrics[
+                    "Max Drawdown"
+                ]
+            ),
+        )
+    )
+
+
+def update_strategy_overview_row(
+    page_id,
+    metrics,
+):
+    properties = {
+
+        "YTD Return": (
+            notion_performance_number(
+                metrics[
+                    "YTD Return"
+                ]
+            )
+        ),
+
+        "Since 2016": (
+            notion_performance_number(
+                metrics[
+                    "Since 2016"
+                ]
+            )
+        ),
+
+        "CAGR": (
+            notion_performance_number(
+                metrics[
+                    "CAGR"
+                ]
+            )
+        ),
+
+        "Max Drawdown": (
+            notion_performance_number(
+                metrics[
+                    "Max Drawdown"
+                ]
+            )
+        ),
+    }
+
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": properties
+        },
+    )
+
+
+def sync_strategy_overview():
+    print()
+    print("=" * 70)
+    print(
+        "NOTION STRATEGY OVERVIEW"
+    )
+    print("=" * 70)
+
+    summary = (
+        load_strategy_summary()
+    )
+
+    names = [
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    ]
+
+    updated = 0
+    unchanged = 0
+
+    for name in names:
+
+        if name not in summary:
+            raise RuntimeError(
+                f"Summary does not contain "
+                f"'{name}'."
+            )
+
+        metrics = summary[
+            name
+        ]
+
+        page = (
+            find_strategy_overview_page(
+                name
+            )
+        )
+
+        if strategy_overview_matches(
+            page,
+            metrics,
+        ):
+
+            print(
+                f"⏭️ {name}: unchanged"
+            )
+
+            unchanged += 1
+
+            continue
+
+        update_strategy_overview_row(
+            page[
+                "id"
+            ],
+            metrics,
+        )
+
+        print(
+            f"✏️ {name}: updated"
+        )
+
+        updated += 1
+
+        time.sleep(
+            WRITE_DELAY_SECONDS
+        )
+
+    print()
+
+    print(
+        "Rows checked :",
+        len(
+            names
+        ),
+    )
+
+    print(
+        "Updated      :",
+        updated,
+    )
+
+    print(
+        "Unchanged    :",
+        unchanged,
+    )
+
+    print()
+
+    print(
+        "✅ Strategy Overview synced "
+        "to Notion"
     )
 
 
@@ -1337,13 +1597,17 @@ def sync_one_month(
 
     qqq_return = (
         normalize_performance(
-            row["QQQ"]
+            row[
+                "QQQ"
+            ]
         )
     )
 
     spy_return = (
         normalize_performance(
-            row["SPY"]
+            row[
+                "SPY"
+            ]
         )
     )
 
@@ -1419,7 +1683,9 @@ def sync_one_month(
         return "unchanged"
 
     update_month_row(
-        page["id"],
+        page[
+            "id"
+        ],
         month_start,
         strategy_return,
         qqq_return,
@@ -1462,6 +1728,7 @@ def sync_monthly_performance():
     for month in recent[
         "Month"
     ]:
+
         print(
             f"  {month}"
         )
@@ -1962,6 +2229,7 @@ def sync_annual_performance():
         )
 
     print()
+
     print(
         "Checking periods:"
     )
@@ -2637,7 +2905,9 @@ def sync_position_history():
             page,
             row,
         ):
+
             unchanged += 1
+
             continue
 
         update_history_row(
@@ -2744,19 +3014,22 @@ def main():
         "to Notion..."
     )
 
-    # 1. Strategy 1 detailed Current Status
+    # 1. Strategy 1 detail status
     sync_current_status()
 
-    # 2. Main page Current Positions
+    # 2. Main-page Current Positions
     sync_main_current_positions()
 
-    # 3. Current month + previous month
+    # 3. Main-page Strategy Overview
+    sync_strategy_overview()
+
+    # 4. Current month + previous month
     sync_monthly_performance()
 
-    # 4. Current year + previous year
+    # 5. Current year + previous year
     sync_annual_performance()
 
-    # 5. Recent Position History maintenance
+    # 6. Recent Position History
     sync_position_history()
 
     print()
