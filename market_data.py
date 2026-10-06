@@ -1,869 +1,660 @@
-from datetime import timedelta
-import math
+import json
+import os
+import urllib.error
+import urllib.request
 
 import pandas as pd
 import pandas_market_calendars as mcal
-import yfinance as yf
-
-
-MARKET_CALENDAR = mcal.get_calendar("NYSE")
-
-# 每次运行检查最近多少个交易日。
-# 10 个交易日足够覆盖“昨天/前几天数据后来补齐”的情况。
-REPAIR_LOOKBACK_SESSIONS = 10
-
-DATA_PROVIDER = "Yahoo Finance via yfinance"
-
-
-class LatestSessionUnavailable(RuntimeError):
-    pass
 
 
 # ============================================================
-# BASIC HELPERS
+# CONFIG
 # ============================================================
 
-def _valid_price(value):
+NOTION_TOKEN = os.environ["NOTION_TOKEN"]
+
+STRATEGY1_STATUS_DATA_SOURCE_ID = os.environ[
+    "STRATEGY1_STATUS_DATA_SOURCE_ID"
+]
+
+NOTION_VERSION = "2025-09-03"
+
+SUMMARY_FILE = (
+    "output/strategy1_summary.json"
+)
+
+NYSE = mcal.get_calendar("NYSE")
+
+
+# ============================================================
+# NOTION API
+# ============================================================
+
+def notion_request(
+    method,
+    path,
+    body=None,
+):
     """
-    Valid market price:
-    - numeric
-    - finite
-    - > 0
+    Make a Notion API request without ever
+    printing the token.
     """
+
+    url = (
+        "https://api.notion.com/v1/"
+        + path
+    )
+
+    data = None
+
+    if body is not None:
+        data = json.dumps(
+            body
+        ).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers={
+            "Authorization": (
+                f"Bearer {NOTION_TOKEN}"
+            ),
+            "Notion-Version": (
+                NOTION_VERSION
+            ),
+            "Content-Type": (
+                "application/json"
+            ),
+        },
+    )
 
     try:
-        value = float(value)
-    except (TypeError, ValueError):
-        return False
 
-    return (
-        math.isfinite(value)
-        and value > 0
-    )
+        with urllib.request.urlopen(
+            request
+        ) as response:
 
+            text = (
+                response
+                .read()
+                .decode("utf-8")
+            )
 
-def _normalize_daily_index(df):
-    """
-    Normalize Yahoo daily timestamps to plain dates.
-    """
+            if not text:
+                return {}
 
-    df = df.copy()
+            return json.loads(
+                text
+            )
 
-    idx = pd.DatetimeIndex(
-        df.index
-    )
+    except urllib.error.HTTPError as e:
 
-    if idx.tz is not None:
-        idx = idx.tz_localize(None)
-
-    df.index = idx.normalize()
-
-    df = df[
-        ~df.index.duplicated(
-            keep="last"
+        error_body = (
+            e.read()
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
         )
-    ]
 
-    return df.sort_index()
+        raise RuntimeError(
+            f"Notion API failed: "
+            f"HTTP {e.code} "
+            f"{e.reason}\n"
+            f"{error_body}"
+        ) from e
 
 
-def _daily_row_is_valid(
-    df,
-    date,
-):
+# ============================================================
+# FIND STRATEGY 1 STATUS ROW
+# ============================================================
+
+def find_current_status_page():
     """
-    Date existing is NOT enough.
+    Find the existing Current Status row whose Name is:
 
-    Both Open and Close must be valid.
+        Strategy 1
+
+    We UPDATE this page.
+
+    We do NOT create another row.
     """
 
-    if date not in df.index:
-        return False
-
-    row = df.loc[date]
-
-    return (
-        _valid_price(row["Open"])
-        and
-        _valid_price(row["Close"])
+    result = notion_request(
+        "POST",
+        (
+            "data_sources/"
+            f"{STRATEGY1_STATUS_DATA_SOURCE_ID}"
+            "/query"
+        ),
+        {
+            "filter": {
+                "property": "Name",
+                "title": {
+                    "equals": "Strategy 1"
+                },
+            },
+            "page_size": 10,
+        },
     )
 
+    pages = result.get(
+        "results",
+        [],
+    )
+
+    if len(pages) == 0:
+
+        raise RuntimeError(
+            "Could not find the "
+            "'Strategy 1' row in "
+            "Strategy 1 Current Status."
+        )
+
+    if len(pages) > 1:
+
+        raise RuntimeError(
+            "More than one row named "
+            "'Strategy 1' was found. "
+            "Refusing to guess which "
+            "one should be updated."
+        )
+
+    return pages[0]["id"]
+
 
 # ============================================================
-# MARKET CALENDAR
+# NEXT TRADING DAY
 # ============================================================
 
-def get_latest_completed_session(
-    now=None,
+def get_next_trading_day(
+    signal_date,
 ):
     """
-    Return latest officially completed
-    US stock market session.
+    Signal is generated at today's close.
+
+    Execute Date must therefore be the NEXT
+    actual US trading session.
 
     Handles:
     - weekends
     - holidays
-    - early closes
     """
 
-    if now is None:
-
-        now_utc = pd.Timestamp.now(
-            tz="UTC"
-        )
-
-    else:
-
-        now_utc = pd.Timestamp(now)
-
-        if now_utc.tzinfo is None:
-            now_utc = now_utc.tz_localize(
-                "UTC"
-            )
-        else:
-            now_utc = now_utc.tz_convert(
-                "UTC"
-            )
-
-    now_et = now_utc.tz_convert(
-        "America/New_York"
-    )
-
-    start_date = (
-        now_et.date()
-        - timedelta(days=20)
-    )
-
-    end_date = (
-        now_et.date()
-        + timedelta(days=1)
-    )
-
-    schedule = MARKET_CALENDAR.schedule(
-        start_date=start_date,
-        end_date=end_date,
-    )
-
-    if schedule.empty:
-        raise LatestSessionUnavailable(
-            "No market sessions found."
-        )
-
-    completed = schedule[
-        schedule["market_close"]
-        <= now_utc
-    ]
-
-    if completed.empty:
-        raise LatestSessionUnavailable(
-            "No completed market session yet."
-        )
-
-    session_date = pd.Timestamp(
-        completed.index[-1]
+    signal_date = pd.Timestamp(
+        signal_date
     ).normalize()
 
-    row = completed.iloc[-1]
-
-    return {
-        "date": session_date,
-        "market_open": pd.Timestamp(
-            row["market_open"]
-        ).tz_convert("UTC"),
-        "market_close": pd.Timestamp(
-            row["market_close"]
-        ).tz_convert("UTC"),
-    }
-
-
-def _get_recent_completed_sessions(
-    latest_session,
-    count=REPAIR_LOOKBACK_SESSIONS,
-):
-    """
-    Build official session information
-    for the most recent completed sessions.
-
-    These are the dates that MUST exist
-    in our daily history.
-    """
-
-    target_date = latest_session["date"]
-
-    # Plenty of calendar room for 10 trading days.
     start_date = (
-        target_date
-        - pd.Timedelta(days=35)
-    )
-
-    schedule = MARKET_CALENDAR.schedule(
-        start_date=start_date.date(),
-        end_date=target_date.date(),
-    )
-
-    if schedule.empty:
-        raise LatestSessionUnavailable(
-            "Cannot build recent market schedule."
-        )
-
-    schedule = schedule.tail(
-        count
-    )
-
-    sessions = []
-
-    for date, row in schedule.iterrows():
-
-        sessions.append(
-            {
-                "date": pd.Timestamp(
-                    date
-                ).normalize(),
-
-                "market_open": pd.Timestamp(
-                    row["market_open"]
-                ).tz_convert("UTC"),
-
-                "market_close": pd.Timestamp(
-                    row["market_close"]
-                ).tz_convert("UTC"),
-            }
-        )
-
-    return sessions
-
-
-# ============================================================
-# INTRADAY DOWNLOAD
-# ============================================================
-
-def _download_intraday(
-    ticker,
-    interval,
-):
-    """
-    Download recent intraday history.
-
-    5m:
-        use 30 days so recent historical
-        missing sessions can be repaired.
-
-    1m:
-        Yahoo only provides a much shorter
-        recent history, so use 7 days.
-
-    prepost=False is requested, AND
-    official market hours are filtered again.
-    """
-
-    if interval == "5m":
-        period = "30d"
-
-    elif interval == "1m":
-        period = "7d"
-
-    else:
-        raise ValueError(
-            f"Unsupported interval: {interval}"
-        )
-
-    df = yf.Ticker(
-        ticker
-    ).history(
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        actions=False,
-        prepost=False,
-    )
-
-    if df.empty:
-        return pd.DataFrame()
-
-    if (
-        "Open" not in df.columns
-        or
-        "Close" not in df.columns
-    ):
-        return pd.DataFrame()
-
-    df = df[
-        [
-            "Open",
-            "Close",
-        ]
-    ].copy()
-
-    df.index = pd.to_datetime(
-        df.index,
-        utc=True,
-    )
-
-    df = df.sort_index()
-
-    return df
-
-
-# ============================================================
-# BUILD ONE DAILY BAR FROM INTRADAY DATA
-# ============================================================
-
-def _build_daily_from_intraday(
-    intraday,
-    session,
-    interval,
-):
-    """
-    Build Open / Close for ONE official session.
-
-    Normal day:
-
-    5m:
-        Open  = 09:30 bar Open
-        Close = 15:55 bar Close
-
-    1m:
-        Open  = 09:30 bar Open
-        Close = 15:59 bar Close
-
-    Early-close days are automatically handled
-    using the official market_close timestamp.
-
-    Premarket and after-hours are NEVER used.
-    """
-
-    if intraday is None or intraday.empty:
-        return None
-
-    market_open = session[
-        "market_open"
-    ]
-
-    market_close = session[
-        "market_close"
-    ]
-
-    if interval == "5m":
-
-        bar_length = pd.Timedelta(
-            minutes=5
-        )
-
-    elif interval == "1m":
-
-        bar_length = pd.Timedelta(
-            minutes=1
-        )
-
-    else:
-
-        raise ValueError(
-            f"Unsupported interval: {interval}"
-        )
-
-    expected_first_bar = (
-        market_open
-    )
-
-    expected_last_bar = (
-        market_close
-        - bar_length
-    )
-
-    # --------------------------------------------------------
-    # Strict regular-session filter.
-    # --------------------------------------------------------
-
-    regular = intraday[
-        (
-            intraday.index
-            >= market_open
-        )
-        &
-        (
-            intraday.index
-            < market_close
-        )
-    ].copy()
-
-    if regular.empty:
-        return None
-
-    # Must have official opening bar.
-    if (
-        expected_first_bar
-        not in regular.index
-    ):
-        return None
-
-    # Must have official closing bar.
-    #
-    # We NEVER use merely:
-    #     regular.iloc[-1]
-    #
-    # because that could hide incomplete data.
-    if (
-        expected_last_bar
-        not in regular.index
-    ):
-        return None
-
-    first_bar = regular.loc[
-        expected_first_bar
-    ]
-
-    last_bar = regular.loc[
-        expected_last_bar
-    ]
-
-    open_price = first_bar[
-        "Open"
-    ]
-
-    close_price = last_bar[
-        "Close"
-    ]
-
-    if not (
-        _valid_price(open_price)
-        and
-        _valid_price(close_price)
-    ):
-        return None
-
-    return {
-        "Open": float(
-            open_price
-        ),
-        "Close": float(
-            close_price
-        ),
-        "source": (
-            f"{interval}_fallback"
-        ),
-    }
-
-
-# ============================================================
-# MAIN DATA LOADER
-# ============================================================
-
-def load_daily_history(
-    ticker,
-    start_date,
-    session=None,
-):
-    """
-    Download daily history and automatically
-    repair recent missing trading sessions.
-
-    Workflow:
-
-        Download Daily
-            ↓
-        Compare recent dates with
-        official NYSE calendar
-            ↓
-        Missing / incomplete session?
-            ↓
-        Try 5m regular-session data
-            ↓
-        Try 1m regular-session data
-            ↓
-        Still missing?
-            ↓
-        FAIL
-
-    This prevents a missing day from being
-    silently skipped by the backtest.
-    """
-
-    if session is None:
-
-        session = (
-            get_latest_completed_session()
-        )
-
-    target_date = session[
-        "date"
-    ]
-
-    # Yahoo end date is exclusive.
-    end_date = (
-        target_date
+        signal_date
         + pd.Timedelta(days=1)
     )
 
-    print(
-        f"Downloading "
-        f"{ticker} daily..."
+    end_date = (
+        signal_date
+        + pd.Timedelta(days=14)
     )
 
-    daily = yf.Ticker(
-        ticker
-    ).history(
-        start=start_date,
-        end=end_date.strftime(
-            "%Y-%m-%d"
-        ),
-        interval="1d",
-        auto_adjust=True,
-        actions=False,
-        prepost=False,
+    schedule = NYSE.schedule(
+        start_date=start_date.date(),
+        end_date=end_date.date(),
     )
 
-    if daily.empty:
+    if schedule.empty:
 
         raise RuntimeError(
-            f"No daily data returned "
-            f"for {ticker}"
+            "Could not determine "
+            "next trading day."
+        )
+
+    return (
+        pd.Timestamp(
+            schedule.index[0]
+        )
+        .strftime("%Y-%m-%d")
+    )
+
+
+# ============================================================
+# DATA SOURCE DISPLAY
+# ============================================================
+
+def short_source_name(
+    source,
+):
+    """
+    Convert internal source names into
+    cleaner Notion display names.
+    """
+
+    mapping = {
+        "daily": "daily",
+        "5m_fallback": "5m",
+        "1m_fallback": "1m",
+    }
+
+    return mapping.get(
+        source,
+        source,
+    )
+
+
+def build_data_source_text(
+    data_sources,
+):
+    """
+    Examples:
+
+    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
+
+    or:
+
+    Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
+    """
+
+    order = [
+        "NDX",
+        "SPX",
+        "QQQ",
+        "SPY",
+        "AGG",
+    ]
+
+    grouped = {}
+
+    for ticker in order:
+
+        source = short_source_name(
+            data_sources[
+                ticker
+            ]
+        )
+
+        grouped.setdefault(
+            source,
+            [],
+        ).append(
+            ticker
+        )
+
+    parts = [
+        "Yahoo"
+    ]
+
+    for source, tickers in (
+        grouped.items()
+    ):
+
+        names = "/".join(
+            tickers
+        )
+
+        parts.append(
+            f"{names}: {source}"
+        )
+
+    return " | ".join(
+        parts
+    )
+
+
+# ============================================================
+# PROPERTY HELPERS
+# ============================================================
+
+def notion_text(
+    value,
+):
+    return {
+        "rich_text": [
+            {
+                "type": "text",
+                "text": {
+                    "content": str(
+                        value
+                    )
+                },
+            }
+        ]
+    }
+
+
+def notion_select(
+    value,
+):
+    return {
+        "select": {
+            "name": str(
+                value
+            )
+        }
+    }
+
+
+def notion_number(
+    value,
+):
+    return {
+        "number": float(
+            value
+        )
+    }
+
+
+def notion_checkbox(
+    value,
+):
+    return {
+        "checkbox": bool(
+            value
+        )
+    }
+
+
+def notion_date(
+    value,
+):
+    return {
+        "date": {
+            "start": str(
+                value
+            )
+        }
+    }
+
+
+# ============================================================
+# LOAD STRATEGY OUTPUT
+# ============================================================
+
+def load_strategy_output():
+
+    with open(
+        SUMMARY_FILE,
+        "r",
+        encoding="utf-8",
+    ) as f:
+
+        payload = json.load(
+            f
         )
 
     if (
-        "Open" not in daily.columns
-        or
-        "Close" not in daily.columns
+        "current_status"
+        not in payload
     ):
 
         raise RuntimeError(
-            f"Missing Open/Close "
-            f"for {ticker}"
+            "strategy1_summary.json "
+            "does not contain "
+            "current_status."
         )
 
-    daily = daily[
-        [
-            "Open",
-            "Close",
-        ]
-    ].copy()
-
-    daily = _normalize_daily_index(
-        daily
-    )
-
-    # ========================================================
-    # CHECK RECENT OFFICIAL TRADING SESSIONS
-    # ========================================================
-
-    recent_sessions = (
-        _get_recent_completed_sessions(
-            session
-        )
-    )
-
-    missing_sessions = []
-
-    for recent_session in recent_sessions:
-
-        date = recent_session[
-            "date"
-        ]
-
-        if not _daily_row_is_valid(
-            daily,
-            date,
-        ):
-
-            missing_sessions.append(
-                recent_session
-            )
-
-    # ========================================================
-    # Everything already complete
-    # ========================================================
-
-    if not missing_sessions:
-
-        print(
-            f"✅ {ticker}: "
-            f"recent {len(recent_sessions)} "
-            f"sessions complete"
-        )
-
-        latest_source = "daily"
-
-        daily.attrs[
-            "provider"
-        ] = DATA_PROVIDER
-
-        daily.attrs[
-            "latest_source"
-        ] = latest_source
-
-        daily.attrs[
-            "repaired_sessions"
-        ] = []
-
-        return (
-            daily,
-            latest_source,
-            session,
-        )
-
-    # ========================================================
-    # REPORT GAPS
-    # ========================================================
-
-    missing_dates = [
-        item["date"].strftime(
-            "%Y-%m-%d"
-        )
-        for item in missing_sessions
+    return payload[
+        "current_status"
     ]
 
-    print(
-        f"⚠️ {ticker}: "
-        f"missing/incomplete sessions: "
-        f"{', '.join(missing_dates)}"
+
+# ============================================================
+# SYNC CURRENT STATUS
+# ============================================================
+
+def sync_current_status():
+
+    status = (
+        load_strategy_output()
     )
 
-    # Remove invalid rows before reconstructing.
-    for missing in missing_sessions:
+    # --------------------------------------------------------
+    # Signal Date
+    # --------------------------------------------------------
 
-        date = missing[
-            "date"
-        ]
+    signal_date = status[
+        "Signal Date"
+    ]
 
-        if date in daily.index:
-            daily = daily.drop(
-                index=date
-            )
+    # --------------------------------------------------------
+    # Execute Date
+    #
+    # Must be next ACTUAL trading day.
+    # --------------------------------------------------------
 
-    # ========================================================
-    # DOWNLOAD 5m ONCE
-    # ========================================================
-
-    print(
-        f"⚠️ {ticker}: "
-        f"loading 5m repair data..."
-    )
-
-    intraday_5m = (
-        _download_intraday(
-            ticker,
-            "5m",
+    execute_date = (
+        get_next_trading_day(
+            signal_date
         )
     )
 
-    repaired = []
-    unresolved = []
+    # --------------------------------------------------------
+    # Human-readable data source
+    # --------------------------------------------------------
 
-    for missing in missing_sessions:
-
-        date = missing[
-            "date"
-        ]
-
-        fallback = (
-            _build_daily_from_intraday(
-                intraday_5m,
-                missing,
-                "5m",
-            )
-        )
-
-        if fallback is None:
-
-            unresolved.append(
-                missing
-            )
-
-            continue
-
-        daily.loc[
-            date,
-            "Open",
-        ] = fallback["Open"]
-
-        daily.loc[
-            date,
-            "Close",
-        ] = fallback["Close"]
-
-        repaired.append(
-            {
-                "date": date.strftime(
-                    "%Y-%m-%d"
-                ),
-                "source": (
-                    "5m_fallback"
-                ),
-            }
-        )
-
-        print(
-            f"✅ {ticker}: "
-            f"repaired "
-            f"{date.date()} "
-            f"with 5m"
-        )
-
-    # ========================================================
-    # TRY 1m FOR ANYTHING 5m COULD NOT REPAIR
-    # ========================================================
-
-    if unresolved:
-
-        print(
-            f"⚠️ {ticker}: "
-            f"some sessions could not "
-            f"be repaired with 5m; "
-            f"loading 1m..."
-        )
-
-        intraday_1m = (
-            _download_intraday(
-                ticker,
-                "1m",
-            )
-        )
-
-        still_unresolved = []
-
-        for missing in unresolved:
-
-            date = missing[
-                "date"
+    data_source_text = (
+        build_data_source_text(
+            status[
+                "Data Sources"
             ]
-
-            fallback = (
-                _build_daily_from_intraday(
-                    intraday_1m,
-                    missing,
-                    "1m",
-                )
-            )
-
-            if fallback is None:
-
-                still_unresolved.append(
-                    missing
-                )
-
-                continue
-
-            daily.loc[
-                date,
-                "Open",
-            ] = fallback["Open"]
-
-            daily.loc[
-                date,
-                "Close",
-            ] = fallback["Close"]
-
-            repaired.append(
-                {
-                    "date": date.strftime(
-                        "%Y-%m-%d"
-                    ),
-                    "source": (
-                        "1m_fallback"
-                    ),
-                }
-            )
-
-            print(
-                f"✅ {ticker}: "
-                f"repaired "
-                f"{date.date()} "
-                f"with 1m"
-            )
-
-        unresolved = (
-            still_unresolved
         )
+    )
 
-    # ========================================================
-    # FAIL IF ANY OFFICIAL SESSION IS STILL MISSING
-    # ========================================================
+    # --------------------------------------------------------
+    # Find existing Strategy 1 row
+    # --------------------------------------------------------
 
-    if unresolved:
+    page_id = (
+        find_current_status_page()
+    )
 
-        dates = [
-            item["date"].strftime(
-                "%Y-%m-%d"
-            )
-            for item in unresolved
-        ]
+    # --------------------------------------------------------
+    # Last Updated
+    # --------------------------------------------------------
 
-        raise LatestSessionUnavailable(
-            f"{ticker}: unable to repair "
-            f"official trading session(s): "
-            f"{', '.join(dates)}. "
-            f"Daily, 5m, and 1m "
-            f"were all unavailable."
+    last_updated = (
+        pd.Timestamp.now(
+            tz="UTC"
         )
+        .isoformat()
+    )
 
-    # ========================================================
-    # FINAL VALIDATION
-    # ========================================================
+    # --------------------------------------------------------
+    # Properties to update
+    # --------------------------------------------------------
 
-    daily = daily.sort_index()
+    properties = {
 
-    for recent_session in recent_sessions:
-
-        date = recent_session[
-            "date"
-        ]
-
-        if not _daily_row_is_valid(
-            daily,
-            date,
-        ):
-
-            raise LatestSessionUnavailable(
-                f"{ticker}: "
-                f"{date.date()} remains "
-                f"invalid after repair."
+        "Current Holding": (
+            notion_select(
+                status[
+                    "Current Holding"
+                ]
             )
+        ),
 
-    # ========================================================
-    # DETERMINE SOURCE USED FOR LATEST SESSION
-    # ========================================================
-
-    latest_source = "daily"
-
-    for item in repaired:
-
-        if (
-            item["date"]
-            == target_date.strftime(
-                "%Y-%m-%d"
+        "Today's Signal": (
+            notion_select(
+                status[
+                    "Today's Signal"
+                ]
             )
-        ):
+        ),
 
-            latest_source = (
-                item["source"]
+        "Next Holding": (
+            notion_select(
+                status[
+                    "Next Holding"
+                ]
             )
+        ),
 
-            break
+        "Signal Date": (
+            notion_date(
+                signal_date
+            )
+        ),
 
-    # ========================================================
-    # ATTACH AUDIT METADATA
-    # ========================================================
+        "Execute Date": (
+            notion_date(
+                execute_date
+            )
+        ),
 
-    daily.attrs[
-        "provider"
-    ] = DATA_PROVIDER
+        "NDX Close": (
+            notion_number(
+                status[
+                    "NDX Close"
+                ]
+            )
+        ),
 
-    daily.attrs[
-        "latest_source"
-    ] = latest_source
+        "NDX MA30": (
+            notion_number(
+                status[
+                    "NDX MA30"
+                ]
+            )
+        ),
 
-    daily.attrs[
-        "repaired_sessions"
-    ] = repaired
+        "NDX > MA30": (
+            notion_checkbox(
+                status[
+                    "NDX > MA30"
+                ]
+            )
+        ),
+
+        "SPX MA50": (
+            notion_number(
+                status[
+                    "SPX MA50"
+                ]
+            )
+        ),
+
+        "SPX MA200": (
+            notion_number(
+                status[
+                    "SPX MA200"
+                ]
+            )
+        ),
+
+        "SPX MA50 > MA200": (
+            notion_checkbox(
+                status[
+                    "SPX MA50 > MA200"
+                ]
+            )
+        ),
+
+        "Reason": (
+            notion_text(
+                status[
+                    "Reason"
+                ]
+            )
+        ),
+
+        "Last Updated": (
+            notion_date(
+                last_updated
+            )
+        ),
+
+        "Data Source": (
+            notion_text(
+                data_source_text
+            )
+        ),
+    }
+
+    # --------------------------------------------------------
+    # Update Notion row
+    # --------------------------------------------------------
+
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": (
+                properties
+            )
+        },
+    )
+
+    # --------------------------------------------------------
+    # Console output
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 70)
+    print(
+        "NOTION CURRENT STATUS"
+    )
+    print("=" * 70)
 
     print(
-        f"✅ {ticker}: "
-        f"{target_date.date()} "
-        f"latest source="
-        f"{latest_source}"
+        "Name            :",
+        "Strategy 1",
     )
 
-    return (
-        daily,
-        latest_source,
-        session,
+    print(
+        "Signal Date     :",
+        signal_date,
     )
+
+    print(
+        "Execute Date    :",
+        execute_date,
+    )
+
+    print(
+        "Current Holding :",
+        status[
+            "Current Holding"
+        ],
+    )
+
+    print(
+        "Today's Signal  :",
+        status[
+            "Today's Signal"
+        ],
+    )
+
+    print(
+        "Next Holding    :",
+        status[
+            "Next Holding"
+        ],
+    )
+
+    print(
+        "Data Source     :",
+        data_source_text,
+    )
+
+    print()
+
+    print(
+        "✅ Strategy 1 Current Status "
+        "updated in Notion"
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "Syncing Strategy 1 "
+        "Current Status to Notion..."
+    )
+
+    sync_current_status()
+
+
+if __name__ == "__main__":
+    main()
