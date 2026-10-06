@@ -23,10 +23,15 @@ STRATEGY1_MONTHLY_DATA_SOURCE_ID = os.environ[
     "STRATEGY1_MONTHLY_DATA_SOURCE_ID"
 ]
 
+STRATEGY1_ANNUAL_DATA_SOURCE_ID = os.environ[
+    "STRATEGY1_ANNUAL_DATA_SOURCE_ID"
+]
+
 NOTION_VERSION = "2025-09-03"
 
 SUMMARY_FILE = "output/strategy1_summary.json"
 MONTHLY_FILE = "output/strategy1_monthly.csv"
+ANNUAL_FILE = "output/strategy1_annual.csv"
 
 NYSE = mcal.get_calendar("NYSE")
 
@@ -36,13 +41,12 @@ WRITE_DELAY_SECONDS = 0.35
 # ============================================================
 # PERFORMANCE PRECISION
 #
-# Notion percent stores decimals:
+# Notion percentage fields store decimals.
 #
 # 0.022210 = 2.2210%
 #
-# 6 stored decimal places
-# =
-# 4 displayed percentage decimal places
+# Six decimal places in storage =
+# four decimal places in percentage display.
 # ============================================================
 
 PERFORMANCE_STORAGE_DECIMALS = 6
@@ -73,9 +77,12 @@ def notion_request(
     data = None
 
     if body is not None:
+
         data = json.dumps(
             body
-        ).encode("utf-8")
+        ).encode(
+            "utf-8"
+        )
 
     request = urllib.request.Request(
         url,
@@ -103,7 +110,9 @@ def notion_request(
             text = (
                 response
                 .read()
-                .decode("utf-8")
+                .decode(
+                    "utf-8"
+                )
             )
 
             if not text:
@@ -132,12 +141,76 @@ def notion_request(
 
 
 # ============================================================
+# QUERY ALL ROWS
+# ============================================================
+
+def query_all_pages(
+    data_source_id,
+):
+    """
+    Read every row from a Notion data source.
+    """
+
+    pages = []
+
+    start_cursor = None
+
+    while True:
+
+        body = {
+            "page_size": 100,
+        }
+
+        if (
+            start_cursor
+            is not None
+        ):
+
+            body[
+                "start_cursor"
+            ] = start_cursor
+
+        result = notion_request(
+            "POST",
+            (
+                "data_sources/"
+                f"{data_source_id}"
+                "/query"
+            ),
+            body,
+        )
+
+        pages.extend(
+            result.get(
+                "results",
+                [],
+            )
+        )
+
+        if not result.get(
+            "has_more",
+            False,
+        ):
+            break
+
+        start_cursor = result.get(
+            "next_cursor"
+        )
+
+        if not start_cursor:
+            break
+
+    return pages
+
+
+# ============================================================
 # PROPERTY BUILDERS
 # ============================================================
 
 def notion_title(
     value,
 ):
+
     return {
         "title": [
             {
@@ -155,6 +228,7 @@ def notion_title(
 def notion_text(
     value,
 ):
+
     return {
         "rich_text": [
             {
@@ -172,6 +246,7 @@ def notion_text(
 def notion_select(
     value,
 ):
+
     return {
         "select": {
             "name": str(
@@ -184,11 +259,6 @@ def notion_select(
 def notion_number(
     value,
 ):
-    """
-    General numeric values such as:
-    - index close
-    - moving averages
-    """
 
     return {
         "number": float(
@@ -201,14 +271,17 @@ def normalize_performance(
     value,
 ):
     """
+    Normalize performance only for Notion.
+
     Example:
 
-    0.022210483...
-    ->
-    0.022210
+        0.022210483
+        ->
+        0.022210
 
-    Notion:
-    2.2210%
+    Notion displays:
+
+        2.2210%
     """
 
     value = float(
@@ -218,6 +291,7 @@ def normalize_performance(
     if not math.isfinite(
         value
     ):
+
         raise ValueError(
             f"Invalid performance value: "
             f"{value}"
@@ -232,6 +306,7 @@ def normalize_performance(
 def notion_performance_number(
     value,
 ):
+
     return {
         "number": (
             normalize_performance(
@@ -244,6 +319,7 @@ def notion_performance_number(
 def notion_checkbox(
     value,
 ):
+
     return {
         "checkbox": bool(
             value
@@ -254,6 +330,7 @@ def notion_checkbox(
 def notion_date(
     value,
 ):
+
     return {
         "date": {
             "start": str(
@@ -267,10 +344,58 @@ def notion_date(
 # PROPERTY READERS
 # ============================================================
 
+def get_title_value(
+    page,
+    property_name,
+):
+
+    prop = (
+        page
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
+    )
+
+    title = prop.get(
+        "title",
+        [],
+    )
+
+    if not title:
+        return None
+
+    parts = []
+
+    for item in title:
+
+        plain_text = item.get(
+            "plain_text"
+        )
+
+        if (
+            plain_text
+            is not None
+        ):
+
+            parts.append(
+                plain_text
+            )
+
+    return "".join(
+        parts
+    )
+
+
 def get_number_value(
     page,
     property_name,
 ):
+
     prop = (
         page
         .get(
@@ -292,6 +417,7 @@ def get_date_value(
     page,
     property_name,
 ):
+
     prop = (
         page
         .get(
@@ -317,13 +443,14 @@ def get_date_value(
 
 
 # ============================================================
-# VALUE COMPARISON
+# COMPARISON
 # ============================================================
 
 def numbers_equal(
     current,
     expected,
 ):
+
     if current is None:
         return False
 
@@ -341,6 +468,7 @@ def numbers_equal(
         TypeError,
         ValueError,
     ):
+
         return False
 
     if (
@@ -352,6 +480,7 @@ def numbers_equal(
             expected
         )
     ):
+
         return False
 
     return math.isclose(
@@ -366,6 +495,7 @@ def dates_equal(
     current,
     expected,
 ):
+
     if current is None:
         return False
 
@@ -399,7 +529,7 @@ def dates_equal(
 
 
 # ============================================================
-# CURRENT STATUS ROW
+# CURRENT STATUS
 # ============================================================
 
 def find_current_status_page():
@@ -460,13 +590,6 @@ def find_current_status_page():
 def get_next_trading_day(
     signal_date,
 ):
-    """
-    Signal:
-        today's close
-
-    Execution:
-        next actual US trading-day open
-    """
 
     signal_date = (
         pd.Timestamp(
@@ -522,6 +645,7 @@ def get_next_trading_day(
 def short_source_name(
     source,
 ):
+
     mapping = {
         "daily": "daily",
         "5m_fallback": "5m",
@@ -537,15 +661,6 @@ def short_source_name(
 def build_data_source_text(
     data_sources,
 ):
-    """
-    Example:
-
-    Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
-
-    or:
-
-    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
-    """
 
     order = [
         "NDX",
@@ -629,7 +744,7 @@ def load_strategy_output():
 
 
 # ============================================================
-# CURRENT STATUS SYNC
+# SYNC CURRENT STATUS
 # ============================================================
 
 def sync_current_status():
@@ -841,15 +956,10 @@ def sync_current_status():
 
 
 # ============================================================
-# MONTHLY RESULTS
+# MONTHLY PERFORMANCE
 # ============================================================
 
 def load_monthly_results():
-    """
-    Full CSV remains available,
-    but Notion only syncs the latest
-    two months.
-    """
 
     monthly = pd.read_csv(
         MONTHLY_FILE,
@@ -893,53 +1003,18 @@ def load_monthly_results():
         ]
     ].copy()
 
-    monthly = monthly.sort_values(
-        "Month"
+    monthly = (
+        monthly.sort_values(
+            "Month"
+        )
     )
-
-    for column in [
-        "Strategy 1",
-        "QQQ",
-        "SPY",
-    ]:
-
-        if monthly[
-            column
-        ].isna().any():
-
-            bad_months = (
-                monthly.loc[
-                    monthly[
-                        column
-                    ].isna(),
-                    "Month",
-                ]
-                .tolist()
-            )
-
-            raise RuntimeError(
-                f"Monthly CSV contains "
-                f"NaN in {column}: "
-                f"{bad_months}"
-            )
 
     return monthly
 
 
-# ============================================================
-# FIND ONE MONTH ROW
-# ============================================================
-
 def find_month_page(
     month,
 ):
-    """
-    Search only one Month row.
-
-    Returns:
-        page
-        or None
-    """
 
     result = notion_request(
         "POST",
@@ -968,7 +1043,7 @@ def find_month_page(
 
         raise RuntimeError(
             "Duplicate Monthly "
-            "Performance rows found: "
+            f"Performance rows: "
             f"{month}"
         )
 
@@ -978,10 +1053,6 @@ def find_month_page(
     return pages[0]
 
 
-# ============================================================
-# CREATE MONTH ROW
-# ============================================================
-
 def create_month_row(
     month,
     month_start,
@@ -990,7 +1061,7 @@ def create_month_row(
     spy_return,
 ):
 
-    return notion_request(
+    notion_request(
         "POST",
         "pages",
         {
@@ -1039,10 +1110,6 @@ def create_month_row(
     )
 
 
-# ============================================================
-# UPDATE MONTH ROW
-# ============================================================
-
 def update_month_row(
     page_id,
     month_start,
@@ -1085,10 +1152,6 @@ def update_month_row(
     )
 
 
-# ============================================================
-# SYNC ONE MONTH
-# ============================================================
-
 def sync_one_month(
     row,
 ):
@@ -1108,25 +1171,19 @@ def sync_one_month(
 
     strategy_return = (
         normalize_performance(
-            row[
-                "Strategy 1"
-            ]
+            row["Strategy 1"]
         )
     )
 
     qqq_return = (
         normalize_performance(
-            row[
-                "QQQ"
-            ]
+            row["QQQ"]
         )
     )
 
     spy_return = (
         normalize_performance(
-            row[
-                "SPY"
-            ]
+            row["SPY"]
         )
     )
 
@@ -1136,27 +1193,17 @@ def sync_one_month(
         )
     )
 
-    # --------------------------------------------------------
-    # New month
-    # --------------------------------------------------------
-
     if page is None:
 
         create_month_row(
             month=month,
-
-            month_start=(
-                month_start
-            ),
-
+            month_start=month_start,
             strategy_return=(
                 strategy_return
             ),
-
             qqq_return=(
                 qqq_return
             ),
-
             spy_return=(
                 spy_return
             ),
@@ -1167,10 +1214,6 @@ def sync_one_month(
         )
 
         return "created"
-
-    # --------------------------------------------------------
-    # Existing month
-    # --------------------------------------------------------
 
     current_month_start = (
         get_date_value(
@@ -1241,19 +1284,15 @@ def sync_one_month(
         page_id=(
             page["id"]
         ),
-
         month_start=(
             month_start
         ),
-
         strategy_return=(
             strategy_return
         ),
-
         qqq_return=(
             qqq_return
         ),
-
         spy_return=(
             spy_return
         ),
@@ -1265,10 +1304,6 @@ def sync_one_month(
 
     return "updated"
 
-
-# ============================================================
-# SYNC RECENT MONTHLY PERFORMANCE
-# ============================================================
 
 def sync_monthly_performance():
 
@@ -1282,24 +1317,6 @@ def sync_monthly_performance():
     monthly = (
         load_monthly_results()
     )
-
-    if monthly.empty:
-
-        raise RuntimeError(
-            "Monthly performance CSV is empty."
-        )
-
-    # --------------------------------------------------------
-    # Only latest month + previous month.
-    #
-    # Example:
-    #
-    # latest = 2026-10
-    #
-    # sync:
-    # 2026-09
-    # 2026-10
-    # --------------------------------------------------------
 
     recent = (
         monthly
@@ -1315,9 +1332,9 @@ def sync_monthly_performance():
         "Checking months:"
     )
 
-    for month in recent[
-        "Month"
-    ]:
+    for month in (
+        recent["Month"]
+    ):
 
         print(
             f"  {month}"
@@ -1341,7 +1358,7 @@ def sync_monthly_performance():
         elif result == "created":
             created += 1
 
-        elif result == "unchanged":
+        else:
             unchanged += 1
 
         time.sleep(
@@ -1381,6 +1398,612 @@ def sync_monthly_performance():
 
 
 # ============================================================
+# ANNUAL PERFORMANCE
+# ============================================================
+
+def load_annual_results():
+    """
+    CSV columns:
+
+        Year
+        Strategy 1
+        QQQ
+        SPY
+    """
+
+    annual = pd.read_csv(
+        ANNUAL_FILE
+    )
+
+    required_columns = {
+        "Year",
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    }
+
+    missing = (
+        required_columns
+        - set(
+            annual.columns
+        )
+    )
+
+    if missing:
+
+        raise RuntimeError(
+            "Annual CSV missing "
+            "required column(s): "
+            + ", ".join(
+                sorted(
+                    missing
+                )
+            )
+        )
+
+    annual = annual[
+        [
+            "Year",
+            "Strategy 1",
+            "QQQ",
+            "SPY",
+        ]
+    ].copy()
+
+    annual[
+        "Year"
+    ] = annual[
+        "Year"
+    ].astype(
+        int
+    )
+
+    annual = (
+        annual.sort_values(
+            "Year"
+        )
+    )
+
+    return annual
+
+
+def annual_period_name(
+    year,
+    latest_year,
+):
+    """
+    Current year:
+
+        2026 YTD
+
+    Closed year:
+
+        2025
+    """
+
+    if year == latest_year:
+
+        return (
+            f"{year} YTD"
+        )
+
+    return str(
+        year
+    )
+
+
+def get_existing_annual_rows():
+    """
+    Map:
+
+        year -> Notion page
+    """
+
+    pages = query_all_pages(
+        STRATEGY1_ANNUAL_DATA_SOURCE_ID
+    )
+
+    result = {}
+
+    for page in pages:
+
+        year = (
+            get_number_value(
+                page,
+                "Year",
+            )
+        )
+
+        if year is None:
+            continue
+
+        year = int(
+            year
+        )
+
+        if year in result:
+
+            raise RuntimeError(
+                "Duplicate Annual "
+                f"Performance year: "
+                f"{year}"
+            )
+
+        result[
+            year
+        ] = page
+
+    return result
+
+
+def create_annual_row(
+    year,
+    period,
+    strategy_return,
+    qqq_return,
+    spy_return,
+):
+
+    notion_request(
+        "POST",
+        "pages",
+        {
+            "parent": {
+                "type": (
+                    "data_source_id"
+                ),
+                "data_source_id": (
+                    STRATEGY1_ANNUAL_DATA_SOURCE_ID
+                ),
+            },
+
+            "properties": {
+
+                "Period": (
+                    notion_title(
+                        period
+                    )
+                ),
+
+                "Year": (
+                    notion_number(
+                        year
+                    )
+                ),
+
+                "Strategy 1": (
+                    notion_performance_number(
+                        strategy_return
+                    )
+                ),
+
+                "QQQ": (
+                    notion_performance_number(
+                        qqq_return
+                    )
+                ),
+
+                "SPY": (
+                    notion_performance_number(
+                        spy_return
+                    )
+                ),
+            },
+        },
+    )
+
+
+def update_annual_row(
+    page_id,
+    period,
+    year,
+    strategy_return,
+    qqq_return,
+    spy_return,
+):
+
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": {
+
+                "Period": (
+                    notion_title(
+                        period
+                    )
+                ),
+
+                "Year": (
+                    notion_number(
+                        year
+                    )
+                ),
+
+                "Strategy 1": (
+                    notion_performance_number(
+                        strategy_return
+                    )
+                ),
+
+                "QQQ": (
+                    notion_performance_number(
+                        qqq_return
+                    )
+                ),
+
+                "SPY": (
+                    notion_performance_number(
+                        spy_return
+                    )
+                ),
+            }
+        },
+    )
+
+
+def annual_row_is_complete(
+    page,
+):
+    """
+    Determine whether existing historical
+    annual values have already been populated.
+    """
+
+    required = [
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    ]
+
+    for name in required:
+
+        value = (
+            get_number_value(
+                page,
+                name,
+            )
+        )
+
+        if value is None:
+            return False
+
+    return True
+
+
+def sync_one_year(
+    row,
+    existing,
+    latest_year,
+):
+
+    year = int(
+        row["Year"]
+    )
+
+    period = (
+        annual_period_name(
+            year,
+            latest_year,
+        )
+    )
+
+    strategy_return = (
+        normalize_performance(
+            row[
+                "Strategy 1"
+            ]
+        )
+    )
+
+    qqq_return = (
+        normalize_performance(
+            row["QQQ"]
+        )
+    )
+
+    spy_return = (
+        normalize_performance(
+            row["SPY"]
+        )
+    )
+
+    page = existing.get(
+        year
+    )
+
+    if page is None:
+
+        create_annual_row(
+            year=year,
+            period=period,
+            strategy_return=(
+                strategy_return
+            ),
+            qqq_return=(
+                qqq_return
+            ),
+            spy_return=(
+                spy_return
+            ),
+        )
+
+        print(
+            f"➕ {period}: created"
+        )
+
+        return "created"
+
+    current_period = (
+        get_title_value(
+            page,
+            "Period",
+        )
+    )
+
+    current_strategy = (
+        get_number_value(
+            page,
+            "Strategy 1",
+        )
+    )
+
+    current_qqq = (
+        get_number_value(
+            page,
+            "QQQ",
+        )
+    )
+
+    current_spy = (
+        get_number_value(
+            page,
+            "SPY",
+        )
+    )
+
+    is_same = (
+
+        current_period
+        == period
+
+        and
+
+        numbers_equal(
+            current_strategy,
+            strategy_return,
+        )
+
+        and
+
+        numbers_equal(
+            current_qqq,
+            qqq_return,
+        )
+
+        and
+
+        numbers_equal(
+            current_spy,
+            spy_return,
+        )
+    )
+
+    if is_same:
+
+        print(
+            f"⏭️ {period}: unchanged"
+        )
+
+        return "unchanged"
+
+    update_annual_row(
+        page_id=(
+            page["id"]
+        ),
+        period=period,
+        year=year,
+        strategy_return=(
+            strategy_return
+        ),
+        qqq_return=(
+            qqq_return
+        ),
+        spy_return=(
+            spy_return
+        ),
+    )
+
+    print(
+        f"✏️ {period}: updated"
+    )
+
+    return "updated"
+
+
+def sync_annual_performance():
+
+    print()
+    print("=" * 70)
+    print(
+        "NOTION ANNUAL PERFORMANCE"
+    )
+    print("=" * 70)
+
+    annual = (
+        load_annual_results()
+    )
+
+    if annual.empty:
+
+        raise RuntimeError(
+            "Annual performance CSV is empty."
+        )
+
+    latest_year = int(
+        annual[
+            "Year"
+        ].max()
+    )
+
+    existing = (
+        get_existing_annual_rows()
+    )
+
+    # --------------------------------------------------------
+    # FIRST INITIALIZATION
+    #
+    # If any year is missing or has blank values,
+    # fill the complete 2016 -> current history.
+    # --------------------------------------------------------
+
+    needs_full_sync = False
+
+    for _, row in (
+        annual.iterrows()
+    ):
+
+        year = int(
+            row["Year"]
+        )
+
+        page = existing.get(
+            year
+        )
+
+        if (
+            page is None
+            or not annual_row_is_complete(
+                page
+            )
+        ):
+
+            needs_full_sync = True
+            break
+
+    if needs_full_sync:
+
+        years_to_sync = (
+            annual.copy()
+        )
+
+        print(
+            "Annual history is not "
+            "fully initialized."
+        )
+
+        print(
+            "Syncing complete history."
+        )
+
+    else:
+
+        # ----------------------------------------------------
+        # DAILY MAINTENANCE
+        #
+        # Only current year + previous year.
+        # ----------------------------------------------------
+
+        years_to_sync = (
+            annual
+            .tail(2)
+            .copy()
+        )
+
+        print(
+            "Annual history already initialized."
+        )
+
+        print(
+            "Checking latest two years only."
+        )
+
+    print()
+
+    print(
+        "Checking periods:"
+    )
+
+    for _, row in (
+        years_to_sync.iterrows()
+    ):
+
+        year = int(
+            row["Year"]
+        )
+
+        print(
+            " ",
+            annual_period_name(
+                year,
+                latest_year,
+            ),
+        )
+
+    print()
+
+    updated = 0
+    created = 0
+    unchanged = 0
+
+    for _, row in (
+        years_to_sync.iterrows()
+    ):
+
+        result = (
+            sync_one_year(
+                row,
+                existing,
+                latest_year,
+            )
+        )
+
+        if result == "updated":
+            updated += 1
+
+        elif result == "created":
+            created += 1
+
+        else:
+            unchanged += 1
+
+        time.sleep(
+            WRITE_DELAY_SECONDS
+        )
+
+    print()
+
+    print(
+        "Years checked :",
+        len(
+            years_to_sync
+        ),
+    )
+
+    print(
+        "Updated       :",
+        updated,
+    )
+
+    print(
+        "Created       :",
+        created,
+    )
+
+    print(
+        "Unchanged     :",
+        unchanged,
+    )
+
+    print()
+
+    print(
+        "✅ Strategy 1 Annual "
+        "Performance synced to Notion"
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -1394,8 +2017,11 @@ def main():
     # 1. Current Status
     sync_current_status()
 
-    # 2. Latest month + previous month
+    # 2. Current month + previous month
     sync_monthly_performance()
+
+    # 3. Annual Performance
+    sync_annual_performance()
 
     print()
     print("=" * 70)
