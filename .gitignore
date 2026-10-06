@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Generated strategy outputs
+output/
+
+# macOS
+.DS_Store
