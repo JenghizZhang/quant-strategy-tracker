@@ -3,13 +3,18 @@ import json
 
 import numpy as np
 import pandas as pd
-import yfinance as yf
+
+from market_data import (
+    get_latest_completed_session,
+    load_daily_history,
+)
 
 
 # ============================================================
 # Strategy 1 — 双轨趋势
 #
-# Signal at today's close:
+# Signal at today's CLOSE:
+#
 # 1. NDX Close > NDX MA30
 #       -> QQQ
 #
@@ -28,7 +33,14 @@ import yfinance as yf
 #
 # Backtest:
 #       From first trading day of 2016
+#
+# Latest market data priority:
+#       Daily
+#       -> 5m regular-session fallback
+#       -> 1m regular-session fallback
+#       -> Fail safely
 # ============================================================
+
 
 DOWNLOAD_START = "2014-01-01"
 BACKTEST_START = pd.Timestamp("2016-01-01")
@@ -36,52 +48,24 @@ BACKTEST_START = pd.Timestamp("2016-01-01")
 NDX = "^NDX"
 SPX = "^GSPC"
 
-ASSETS = ["QQQ", "SPY", "AGG"]
+ASSETS = [
+    "QQQ",
+    "SPY",
+    "AGG",
+]
 
 OUTPUT_DIR = Path("output")
 
 
-# ------------------------------------------------------------
-# Download adjusted historical prices
-# auto_adjust=True:
-# prices are adjusted for splits/dividends
-# ------------------------------------------------------------
-def download_history(ticker):
-    print(f"Downloading {ticker}...")
+# ============================================================
+# SIGNALS
+# ============================================================
 
-    df = yf.Ticker(ticker).history(
-        start=DOWNLOAD_START,
-        auto_adjust=True,
-        actions=False,
-    )
-
-    if df.empty:
-        raise RuntimeError(f"No data returned for {ticker}")
-
-    if "Open" not in df.columns or "Close" not in df.columns:
-        raise RuntimeError(f"Missing Open/Close data for {ticker}")
-
-    df = df[["Open", "Close"]].copy()
-
-    # Remove timezone while preserving the trading date.
-    idx = pd.DatetimeIndex(df.index)
-
-    if idx.tz is not None:
-        idx = idx.tz_localize(None)
-
-    df.index = idx.normalize()
-
-    df = df[~df.index.duplicated(keep="last")]
-    df = df.sort_index()
-    df = df.dropna()
-
-    return df
-
-
-# ------------------------------------------------------------
-# Generate close-of-day signals
-# ------------------------------------------------------------
 def build_signals(ndx, spx):
+    """
+    Build Strategy 1 signals from daily closing data.
+    """
+
     signals = pd.concat(
         [
             ndx["Close"].rename("NDX Close"),
@@ -91,35 +75,73 @@ def build_signals(ndx, spx):
         join="inner",
     ).dropna()
 
+    # ----------------------------------------
+    # Nasdaq 100 MA30
+    # ----------------------------------------
     signals["NDX MA30"] = (
         signals["NDX Close"]
-        .rolling(window=30, min_periods=30)
+        .rolling(
+            window=30,
+            min_periods=30,
+        )
         .mean()
     )
 
+    # ----------------------------------------
+    # S&P 500 MA50
+    # ----------------------------------------
     signals["SPX MA50"] = (
         signals["SPX Close"]
-        .rolling(window=50, min_periods=50)
+        .rolling(
+            window=50,
+            min_periods=50,
+        )
         .mean()
     )
 
+    # ----------------------------------------
+    # S&P 500 MA200
+    # ----------------------------------------
     signals["SPX MA200"] = (
         signals["SPX Close"]
-        .rolling(window=200, min_periods=200)
+        .rolling(
+            window=200,
+            min_periods=200,
+        )
         .mean()
     )
 
     signals = signals.dropna().copy()
 
+    # ----------------------------------------
+    # Rule 1:
+    # NDX > MA30
+    # -> QQQ
+    # ----------------------------------------
     condition_qqq = (
-        signals["NDX Close"] > signals["NDX MA30"]
+        signals["NDX Close"]
+        > signals["NDX MA30"]
     )
 
+    # ----------------------------------------
+    # Rule 2:
+    # NDX <= MA30
+    # AND
+    # SPX MA50 > MA200
+    # -> SPY
+    # ----------------------------------------
     condition_spy = (
         (~condition_qqq)
-        & (signals["SPX MA50"] > signals["SPX MA200"])
+        & (
+            signals["SPX MA50"]
+            > signals["SPX MA200"]
+        )
     )
 
+    # ----------------------------------------
+    # Otherwise:
+    # -> AGG
+    # ----------------------------------------
     signals["Signal"] = np.select(
         [
             condition_qqq,
@@ -139,58 +161,99 @@ def build_signals(ndx, spx):
         ],
         [
             "NDX > MA30 → QQQ",
-            "NDX <= MA30 and SPX MA50 > MA200 → SPY",
+            (
+                "NDX <= MA30 and "
+                "SPX MA50 > MA200 → SPY"
+            ),
         ],
-        default="NDX <= MA30 and SPX MA50 <= MA200 → AGG",
+        default=(
+            "NDX <= MA30 and "
+            "SPX MA50 <= MA200 → AGG"
+        ),
     )
 
-    signals["NDX > MA30"] = condition_qqq
+    signals["NDX > MA30"] = (
+        condition_qqq
+    )
 
     signals["SPX MA50 > MA200"] = (
-        signals["SPX MA50"] > signals["SPX MA200"]
+        signals["SPX MA50"]
+        > signals["SPX MA200"]
     )
 
     return signals
 
 
-# ------------------------------------------------------------
-# Backtest
-#
-# Important:
-#
-# Signal is generated at today's CLOSE.
-# The new position is entered NEXT trading day at OPEN.
-#
-# Therefore:
-#
-# Previous position receives:
-#     previous close -> next open
-#
-# New position receives:
-#     next open -> next close
-#
-# This avoids look-ahead bias.
-# ------------------------------------------------------------
-def run_backtest(signals, prices):
-    # Use only dates available for:
-    # NDX/SPX signal + all 3 ETFs
-    common_index = signals.index.copy()
+# ============================================================
+# BACKTEST
+# ============================================================
+
+def run_backtest(
+    signals,
+    prices,
+):
+    """
+    Strategy execution rule:
+
+        Signal is generated at today's CLOSE.
+
+        New position is entered at
+        NEXT trading day's OPEN.
+
+    Therefore:
+
+        Previous position receives:
+            previous close -> next open
+
+        New/current position receives:
+            next open -> next close
+
+    This avoids look-ahead bias.
+    """
+
+    # ----------------------------------------
+    # Only use dates available across:
+    #
+    # NDX
+    # SPX
+    # QQQ
+    # SPY
+    # AGG
+    # ----------------------------------------
+    common_index = (
+        signals.index.copy()
+    )
 
     for ticker in ASSETS:
-        common_index = common_index.intersection(
-            prices[ticker].index
+        common_index = (
+            common_index.intersection(
+                prices[ticker].index
+            )
         )
 
-    common_index = common_index.sort_values()
+    common_index = (
+        common_index.sort_values()
+    )
 
-    signals = signals.loc[common_index].copy()
+    signals = signals.loc[
+        common_index
+    ].copy()
 
-    execution = pd.DataFrame(index=common_index)
+    execution = pd.DataFrame(
+        index=common_index
+    )
 
-    # Today's execution uses yesterday's closing signal.
-    execution["Target"] = signals["Signal"].shift(1)
+    # ----------------------------------------
+    # Today's open executes yesterday's
+    # closing signal.
+    # ----------------------------------------
+    execution["Target"] = (
+        signals["Signal"].shift(1)
+    )
 
-    execution["Reason"] = signals["Reason"].shift(1)
+    execution["Reason"] = (
+        signals["Reason"].shift(1)
+    )
 
     execution["Signal Date"] = (
         pd.Series(
@@ -200,20 +263,31 @@ def run_backtest(signals, prices):
         .shift(1)
     )
 
+    # ----------------------------------------
+    # Start from 2016
+    # ----------------------------------------
     execution = execution.loc[
-        execution.index >= BACKTEST_START
+        execution.index
+        >= BACKTEST_START
     ].copy()
 
-    execution = execution.dropna(
-        subset=["Target", "Signal Date"]
+    execution = (
+        execution.dropna(
+            subset=[
+                "Target",
+                "Signal Date",
+            ]
+        )
     )
 
     if execution.empty:
         raise RuntimeError(
-            "No backtest dates available after 2016."
+            "No backtest dates "
+            "available after 2016."
         )
 
     equity = 1.0
+
     holding = None
     previous_date = None
 
@@ -221,33 +295,55 @@ def run_backtest(signals, prices):
     position_history = []
 
     for date, row in execution.iterrows():
+
         target = row["Target"]
-        signal_date = row["Signal Date"]
+        signal_date = row[
+            "Signal Date"
+        ]
         reason = row["Reason"]
 
-        # First trading day:
-        # Start with $1 at the opening price.
+        # ====================================
+        # First trading day
+        # ====================================
+
         if previous_date is None:
+
             old_holding = "CASH"
 
             holding = target
 
-            open_price = prices[holding].at[
-                date,
-                "Open",
-            ]
+            open_price = (
+                prices[holding]
+                .at[
+                    date,
+                    "Open",
+                ]
+            )
 
-            close_price = prices[holding].at[
-                date,
-                "Close",
-            ]
+            close_price = (
+                prices[holding]
+                .at[
+                    date,
+                    "Close",
+                ]
+            )
 
-            equity *= close_price / open_price
+            # Start with $1 at the open.
+            equity *= (
+                close_price
+                / open_price
+            )
 
             position_history.append(
                 {
-                    "Change": f"{old_holding} → {holding}",
-                    "Signal Date": signal_date,
+                    "Change": (
+                        f"{old_holding}"
+                        f" → "
+                        f"{holding}"
+                    ),
+                    "Signal Date": (
+                        signal_date
+                    ),
                     "Execute Date": date,
                     "From": old_holding,
                     "To": holding,
@@ -255,60 +351,97 @@ def run_backtest(signals, prices):
                 }
             )
 
+        # ====================================
+        # All later trading days
+        # ====================================
+
         else:
-            # ------------------------------------------------
-            # Overnight return belongs to the OLD position.
-            # ------------------------------------------------
-            old_open = prices[holding].at[
-                date,
-                "Open",
-            ]
 
-            old_previous_close = prices[holding].at[
-                previous_date,
-                "Close",
-            ]
+            # --------------------------------
+            # Overnight:
+            #
+            # yesterday close
+            # ->
+            # today open
+            #
+            # belongs to OLD position.
+            # --------------------------------
 
-            equity *= (
-                old_open / old_previous_close
+            old_open = (
+                prices[holding]
+                .at[
+                    date,
+                    "Open",
+                ]
             )
 
-            # ------------------------------------------------
-            # Switch at today's OPEN if signal changed.
-            # ------------------------------------------------
+            old_previous_close = (
+                prices[holding]
+                .at[
+                    previous_date,
+                    "Close",
+                ]
+            )
+
+            equity *= (
+                old_open
+                / old_previous_close
+            )
+
+            # --------------------------------
+            # Switch exactly at today's OPEN.
+            # --------------------------------
+
             if target != holding:
+
                 old_holding = holding
                 holding = target
 
                 position_history.append(
                     {
                         "Change": (
-                            f"{old_holding} → {holding}"
+                            f"{old_holding}"
+                            f" → "
+                            f"{holding}"
                         ),
-                        "Signal Date": signal_date,
-                        "Execute Date": date,
-                        "From": old_holding,
+                        "Signal Date": (
+                            signal_date
+                        ),
+                        "Execute Date": (
+                            date
+                        ),
+                        "From": (
+                            old_holding
+                        ),
                         "To": holding,
                         "Reason": reason,
                     }
                 )
 
-            # ------------------------------------------------
-            # Intraday return belongs to the NEW/current
-            # position.
-            # ------------------------------------------------
-            current_open = prices[holding].at[
-                date,
-                "Open",
-            ]
+            # --------------------------------
+            # Today's open -> today's close
+            # belongs to NEW/current position.
+            # --------------------------------
 
-            current_close = prices[holding].at[
-                date,
-                "Close",
-            ]
+            current_open = (
+                prices[holding]
+                .at[
+                    date,
+                    "Open",
+                ]
+            )
+
+            current_close = (
+                prices[holding]
+                .at[
+                    date,
+                    "Close",
+                ]
+            )
 
             equity *= (
-                current_close / current_open
+                current_close
+                / current_open
             )
 
         daily_rows.append(
@@ -317,8 +450,12 @@ def run_backtest(signals, prices):
                 "Equity": equity,
                 "Holding": holding,
                 "Target": target,
-                "Signal Date": signal_date,
-                "Signal Reason": reason,
+                "Signal Date": (
+                    signal_date
+                ),
+                "Signal Reason": (
+                    reason
+                ),
             }
         )
 
@@ -328,171 +465,345 @@ def run_backtest(signals, prices):
         daily_rows
     ).set_index("Date")
 
-    history = pd.DataFrame(position_history)
+    history = pd.DataFrame(
+        position_history
+    )
 
-    return daily, history
+    return (
+        daily,
+        history,
+    )
 
 
-# ------------------------------------------------------------
-# Buy & Hold benchmark
-#
-# Benchmark also begins at the OPEN of the same first
-# backtest trading day.
-# ------------------------------------------------------------
-def buy_and_hold_equity(price_df, dates):
+# ============================================================
+# BENCHMARKS
+# ============================================================
+
+def buy_and_hold_equity(
+    price_df,
+    dates,
+):
+    """
+    Benchmark begins at the OPEN of
+    the same first backtest trading day.
+    """
+
     first_date = dates[0]
 
-    initial_open = price_df.at[
-        first_date,
-        "Open",
-    ]
+    initial_open = (
+        price_df.at[
+            first_date,
+            "Open",
+        ]
+    )
 
     equity = (
-        price_df.loc[dates, "Close"]
+        price_df
+        .loc[
+            dates,
+            "Close",
+        ]
         / initial_open
     )
 
     return equity
 
 
-# ------------------------------------------------------------
-# Monthly / annual returns
-# ------------------------------------------------------------
-def calculate_period_returns(equity, period):
+# ============================================================
+# MONTHLY / ANNUAL PERFORMANCE
+# ============================================================
+
+def calculate_period_returns(
+    equity,
+    period,
+):
+
     if period == "month":
-        end_values = equity.groupby(
-            equity.index.to_period("M")
-        ).last()
+
+        end_values = (
+            equity.groupby(
+                equity.index.to_period(
+                    "M"
+                )
+            )
+            .last()
+        )
 
     elif period == "year":
-        end_values = equity.groupby(
-            equity.index.year
-        ).last()
+
+        end_values = (
+            equity.groupby(
+                equity.index.year
+            )
+            .last()
+        )
 
     else:
         raise ValueError(
-            f"Unknown period: {period}"
+            f"Unknown period: "
+            f"{period}"
         )
 
-    returns = end_values.pct_change()
+    returns = (
+        end_values.pct_change()
+    )
 
-    # First period begins from initial equity = 1
+    # ----------------------------------------
+    # First period starts from initial
+    # equity = 1.
+    # ----------------------------------------
     returns.iloc[0] = (
-        end_values.iloc[0] - 1.0
+        end_values.iloc[0]
+        - 1.0
     )
 
     return returns
 
 
-# ------------------------------------------------------------
-# Summary statistics
-# ------------------------------------------------------------
-def calculate_metrics(equity):
-    latest_year = equity.index[-1].year
+# ============================================================
+# SUMMARY METRICS
+# ============================================================
 
+def calculate_metrics(
+    equity,
+):
+
+    latest_year = (
+        equity.index[-1].year
+    )
+
+    # ----------------------------------------
+    # YTD base:
+    # last trading day of prior year
+    # ----------------------------------------
     prior_year_values = equity[
-        equity.index.year < latest_year
+        equity.index.year
+        < latest_year
     ]
 
     if len(prior_year_values) > 0:
-        ytd_base = prior_year_values.iloc[-1]
+        ytd_base = (
+            prior_year_values.iloc[-1]
+        )
     else:
         ytd_base = 1.0
 
     ytd_return = (
-        equity.iloc[-1] / ytd_base
+        equity.iloc[-1]
+        / ytd_base
     ) - 1.0
 
-    since_2016 = equity.iloc[-1] - 1.0
+    # ----------------------------------------
+    # Total return since start
+    # ----------------------------------------
+    since_2016 = (
+        equity.iloc[-1]
+        - 1.0
+    )
 
+    # ----------------------------------------
+    # CAGR
+    # ----------------------------------------
     years = (
-        equity.index[-1]
-        - equity.index[0]
-    ).days / 365.25
+        (
+            equity.index[-1]
+            - equity.index[0]
+        ).days
+        / 365.25
+    )
 
     if years > 0:
+
         cagr = (
-            equity.iloc[-1] ** (1 / years)
+            equity.iloc[-1]
+            ** (1 / years)
         ) - 1.0
+
     else:
+
         cagr = 0.0
 
-    running_max = equity.cummax()
+    # ----------------------------------------
+    # Max Drawdown
+    # ----------------------------------------
+    running_max = (
+        equity.cummax()
+    )
 
     drawdown = (
-        equity / running_max
+        equity
+        / running_max
     ) - 1.0
 
-    max_drawdown = drawdown.min()
+    max_drawdown = (
+        drawdown.min()
+    )
 
     return {
-        "YTD Return": float(ytd_return),
-        "Since 2016": float(since_2016),
-        "CAGR": float(cagr),
-        "Max Drawdown": float(max_drawdown),
+        "YTD Return": float(
+            ytd_return
+        ),
+        "Since 2016": float(
+            since_2016
+        ),
+        "CAGR": float(
+            cagr
+        ),
+        "Max Drawdown": float(
+            max_drawdown
+        ),
     }
 
 
 def percent(value):
-    return f"{value * 100:.2f}%"
+    return (
+        f"{value * 100:.2f}%"
+    )
 
+
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
+
     print("=" * 70)
-    print("Strategy 1 — 双轨趋势")
+    print(
+        "Strategy 1 — 双轨趋势"
+    )
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Download data
-    # --------------------------------------------------------
-    ndx = download_history(NDX)
-    spx = download_history(SPX)
+    # ========================================================
+    # Identify latest COMPLETED market session
+    # ========================================================
 
-    prices = {
-        ticker: download_history(ticker)
-        for ticker in ASSETS
-    }
+    session = (
+        get_latest_completed_session()
+    )
 
-    # --------------------------------------------------------
-    # Signals
-    # --------------------------------------------------------
+    target_date = (
+        session["date"]
+    )
+
+    print()
+
+    print(
+        "Latest completed "
+        "market session:",
+        target_date.date(),
+    )
+
+    print()
+
+    # ========================================================
+    # DOWNLOAD MARKET DATA
+    # ========================================================
+
+    ndx, ndx_source, _ = (
+        load_daily_history(
+            NDX,
+            DOWNLOAD_START,
+            session=session,
+        )
+    )
+
+    spx, spx_source, _ = (
+        load_daily_history(
+            SPX,
+            DOWNLOAD_START,
+            session=session,
+        )
+    )
+
+    prices = {}
+    price_sources = {}
+
+    for ticker in ASSETS:
+
+        df, source, _ = (
+            load_daily_history(
+                ticker,
+                DOWNLOAD_START,
+                session=session,
+            )
+        )
+
+        prices[ticker] = df
+
+        price_sources[
+            ticker
+        ] = source
+
+    # ========================================================
+    # BUILD SIGNALS
+    # ========================================================
+
     signals = build_signals(
         ndx,
         spx,
     )
 
-    # --------------------------------------------------------
-    # Strategy backtest
-    # --------------------------------------------------------
-    strategy_daily, position_history = (
-        run_backtest(
-            signals,
-            prices,
-        )
+    # ========================================================
+    # RUN STRATEGY
+    # ========================================================
+
+    (
+        strategy_daily,
+        position_history,
+    ) = run_backtest(
+        signals,
+        prices,
     )
 
-    dates = strategy_daily.index
+    dates = (
+        strategy_daily.index
+    )
+
+    # ========================================================
+    # CRITICAL FRESHNESS CHECK
+    #
+    # Never silently use yesterday's data
+    # as today's current status.
+    # ========================================================
+
+    if dates[-1] != target_date:
+
+        raise RuntimeError(
+            "Backtest did not reach "
+            "the latest completed "
+            "market session. "
+            f"Expected "
+            f"{target_date.date()}, "
+            f"got "
+            f"{dates[-1].date()}."
+        )
 
     strategy_equity = (
         strategy_daily["Equity"]
     )
 
-    # --------------------------------------------------------
-    # Benchmarks
-    # --------------------------------------------------------
-    qqq_equity = buy_and_hold_equity(
-        prices["QQQ"],
-        dates,
+    # ========================================================
+    # BENCHMARKS
+    # ========================================================
+
+    qqq_equity = (
+        buy_and_hold_equity(
+            prices["QQQ"],
+            dates,
+        )
     )
 
-    spy_equity = buy_and_hold_equity(
-        prices["SPY"],
-        dates,
+    spy_equity = (
+        buy_and_hold_equity(
+            prices["SPY"],
+            dates,
+        )
     )
 
-    # --------------------------------------------------------
-    # Monthly performance
-    # --------------------------------------------------------
+    # ========================================================
+    # MONTHLY PERFORMANCE
+    # ========================================================
+
     monthly = pd.DataFrame(
         {
             "Strategy 1": (
@@ -522,9 +833,10 @@ def main():
 
     monthly.index.name = "Month"
 
-    # --------------------------------------------------------
-    # Annual performance
-    # --------------------------------------------------------
+    # ========================================================
+    # ANNUAL PERFORMANCE
+    # ========================================================
+
     annual = pd.DataFrame(
         {
             "Strategy 1": (
@@ -550,99 +862,160 @@ def main():
 
     annual.index.name = "Year"
 
-    # --------------------------------------------------------
-    # Overall summary
-    # --------------------------------------------------------
+    # ========================================================
+    # OVERALL SUMMARY
+    # ========================================================
+
     summary = {
-        "Strategy 1": calculate_metrics(
-            strategy_equity
+        "Strategy 1": (
+            calculate_metrics(
+                strategy_equity
+            )
         ),
-        "QQQ": calculate_metrics(
-            qqq_equity
+        "QQQ": (
+            calculate_metrics(
+                qqq_equity
+            )
         ),
-        "SPY": calculate_metrics(
-            spy_equity
+        "SPY": (
+            calculate_metrics(
+                spy_equity
+            )
         ),
     }
 
-    # --------------------------------------------------------
-    # Current status
-    # --------------------------------------------------------
-    latest_date = dates[-1]
+    # ========================================================
+    # CURRENT STATUS
+    # ========================================================
 
-    current_holding = (
-        strategy_daily.iloc[-1]["Holding"]
+    latest_date = (
+        dates[-1]
     )
 
-    today_signal = signals.at[
-        latest_date,
-        "Signal",
-    ]
+    # ----------------------------------------
+    # Position actually held during today's
+    # trading session.
+    # ----------------------------------------
+    current_holding = (
+        strategy_daily
+        .iloc[-1]["Holding"]
+    )
 
-    next_holding = today_signal
+    # ----------------------------------------
+    # Today's closing signal.
+    #
+    # This is what should be held starting
+    # NEXT trading day's open.
+    # ----------------------------------------
+    today_signal = (
+        signals.at[
+            latest_date,
+            "Signal",
+        ]
+    )
+
+    next_holding = (
+        today_signal
+    )
+
+    pending_change = (
+        current_holding
+        != next_holding
+    )
 
     current_status = {
+
+        "Data Date": str(
+            latest_date.date()
+        ),
+
         "Signal Date": str(
             latest_date.date()
         ),
+
         "Current Holding": (
             current_holding
         ),
+
         "Today's Signal": (
             today_signal
         ),
+
         "Next Holding": (
             next_holding
         ),
+
         "Pending Change": (
-            current_holding
-            != next_holding
+            pending_change
         ),
+
         "NDX Close": float(
             signals.at[
                 latest_date,
                 "NDX Close",
             ]
         ),
+
         "NDX MA30": float(
             signals.at[
                 latest_date,
                 "NDX MA30",
             ]
         ),
+
         "NDX > MA30": bool(
             signals.at[
                 latest_date,
                 "NDX > MA30",
             ]
         ),
+
         "SPX MA50": float(
             signals.at[
                 latest_date,
                 "SPX MA50",
             ]
         ),
+
         "SPX MA200": float(
             signals.at[
                 latest_date,
                 "SPX MA200",
             ]
         ),
+
         "SPX MA50 > MA200": bool(
             signals.at[
                 latest_date,
                 "SPX MA50 > MA200",
             ]
         ),
-        "Reason": signals.at[
-            latest_date,
-            "Reason",
-        ],
+
+        "Reason": (
+            signals.at[
+                latest_date,
+                "Reason",
+            ]
+        ),
+
+        "Data Sources": {
+
+            "NDX": (
+                ndx_source
+            ),
+
+            "SPX": (
+                spx_source
+            ),
+
+            **price_sources,
+        },
     }
 
-    # --------------------------------------------------------
-    # Save results
-    # --------------------------------------------------------
+    # ========================================================
+    # SAVE RESULTS
+    # ========================================================
+
     OUTPUT_DIR.mkdir(
         parents=True,
         exist_ok=True,
@@ -665,7 +1038,10 @@ def main():
 
     position_history.to_csv(
         OUTPUT_DIR
-        / "strategy1_position_history.csv",
+        / (
+            "strategy1_"
+            "position_history.csv"
+        ),
         index=False,
     )
 
@@ -675,6 +1051,7 @@ def main():
         "w",
         encoding="utf-8",
     ) as f:
+
         json.dump(
             {
                 "summary": summary,
@@ -687,21 +1064,63 @@ def main():
             ensure_ascii=False,
         )
 
-    # --------------------------------------------------------
-    # Console output
-    # --------------------------------------------------------
+    # ========================================================
+    # CONSOLE OUTPUT
+    # ========================================================
+
     print()
-    print("BACKTEST PERIOD")
+
+    print(
+        "BACKTEST PERIOD"
+    )
+
     print(
         f"{dates[0].date()}"
         f" → "
         f"{dates[-1].date()}"
     )
 
+    # ========================================================
+    # DATA SOURCES
+    # ========================================================
+
     print()
+
+    print("=" * 70)
+    print("DATA SOURCES")
+    print("=" * 70)
+
+    print(
+        f"NDX : "
+        f"{ndx_source}"
+    )
+
+    print(
+        f"SPX : "
+        f"{spx_source}"
+    )
+
+    for ticker in ASSETS:
+
+        print(
+            f"{ticker:<3} : "
+            f"{price_sources[ticker]}"
+        )
+
+    # ========================================================
+    # CURRENT STATUS
+    # ========================================================
+
+    print()
+
     print("=" * 70)
     print("CURRENT STATUS")
     print("=" * 70)
+
+    print(
+        "Data Date       :",
+        latest_date.date(),
+    )
 
     print(
         "Current Holding :",
@@ -722,13 +1141,13 @@ def main():
         "Pending Change  :",
         (
             "YES"
-            if current_holding
-            != next_holding
+            if pending_change
             else "NO"
         ),
     )
 
     print()
+
     print(
         f"NDX Close       : "
         f"{current_status['NDX Close']:.2f}"
@@ -747,6 +1166,7 @@ def main():
     )
 
     print()
+
     print(
         f"SPX MA50        : "
         f"{current_status['SPX MA50']:.2f}"
@@ -765,84 +1185,123 @@ def main():
     )
 
     print()
+
     print(
         "Reason           :",
         current_status["Reason"],
     )
 
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
     print()
+
     print("=" * 70)
     print("SUMMARY")
     print("=" * 70)
 
-    for name, metrics in summary.items():
+    for name, metrics in (
+        summary.items()
+    ):
+
         print()
         print(name)
 
         print(
             "  YTD Return    :",
             percent(
-                metrics["YTD Return"]
+                metrics[
+                    "YTD Return"
+                ]
             ),
         )
 
         print(
             "  Since 2016    :",
             percent(
-                metrics["Since 2016"]
+                metrics[
+                    "Since 2016"
+                ]
             ),
         )
 
         print(
             "  CAGR          :",
             percent(
-                metrics["CAGR"]
+                metrics[
+                    "CAGR"
+                ]
             ),
         )
 
         print(
             "  Max Drawdown  :",
             percent(
-                metrics["Max Drawdown"]
+                metrics[
+                    "Max Drawdown"
+                ]
             ),
         )
 
+    # ========================================================
+    # LATEST 12 MONTHS
+    # ========================================================
+
     print()
+
     print("=" * 70)
     print("LATEST 12 MONTHS")
     print("=" * 70)
 
     print(
-        monthly.tail(12)
+        monthly
+        .tail(12)
         .to_string(
-            float_format=lambda x: (
-                f"{x * 100:.2f}%"
+            float_format=(
+                lambda x: (
+                    f"{x * 100:.2f}%"
+                )
             )
         )
     )
 
+    # ========================================================
+    # ANNUAL RETURNS
+    # ========================================================
+
     print()
+
     print("=" * 70)
     print("ANNUAL RETURNS")
     print("=" * 70)
 
     print(
         annual.to_string(
-            float_format=lambda x: (
-                f"{x * 100:.2f}%"
+            float_format=(
+                lambda x: (
+                    f"{x * 100:.2f}%"
+                )
             )
         )
     )
 
+    # ========================================================
+    # POSITION HISTORY
+    # ========================================================
+
     print()
+
     print(
         f"Position changes: "
         f"{len(position_history)}"
     )
 
     print()
+
     print(
-        "✅ Strategy 1 backtest completed"
+        "✅ Strategy 1 "
+        "backtest completed"
     )
 
 
