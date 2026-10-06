@@ -1,8 +1,14 @@
 name: Backtest Strategy 1
 
 on:
-  # 保留手动运行，方便测试
+  # 手动运行时可以选择是否进行一次完整历史重建
   workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Rebuild all Strategy 1 historical Notion data"
+        required: true
+        type: boolean
+        default: false
 
   # GitHub cron 使用 UTC
   #
@@ -11,7 +17,7 @@ on:
   # 美东夏令时：前一天 9:30 PM
   # 美东冬令时：前一天 8:30 PM
   #
-  # 都已经距离美股 4:00 PM 收盘至少 4.5 小时
+  # 自动 schedule 没有手动 input，因此 FULL_REBUILD 会自动是 false
   schedule:
     - cron: "30 1 * * 2-6"
 
@@ -47,23 +53,21 @@ jobs:
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
 
+          NOTION_MAIN_PAGE_ID: ${{ secrets.NOTION_MAIN_PAGE_ID }}
+          NOTION_MENTION_NAME: ${{ secrets.NOTION_MENTION_NAME }}
+
           STRATEGY1_STATUS_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_STATUS_DATA_SOURCE_ID }}
-
           STRATEGY1_MONTHLY_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_MONTHLY_DATA_SOURCE_ID }}
-
           STRATEGY1_ANNUAL_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_ANNUAL_DATA_SOURCE_ID }}
-
           STRATEGY1_HISTORY_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_HISTORY_DATA_SOURCE_ID }}
 
           CURRENT_POSITIONS_DATA_SOURCE_ID: ${{ secrets.CURRENT_POSITIONS_DATA_SOURCE_ID }}
-
           STRATEGY_OVERVIEW_DATA_SOURCE_ID: ${{ secrets.STRATEGY_OVERVIEW_DATA_SOURCE_ID }}
-
           ANNUAL_PERFORMANCE_DATA_SOURCE_ID: ${{ secrets.ANNUAL_PERFORMANCE_DATA_SOURCE_ID }}
 
-          NOTION_MAIN_PAGE_ID: ${{ secrets.NOTION_MAIN_PAGE_ID }}
-          
-          NOTION_MENTION_NAME: ${{ secrets.NOTION_MENTION_NAME }}
+          # 手动运行且勾选 full_rebuild 时为 true；
+          # schedule 或普通手动运行时为 false。
+          FULL_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_rebuild || false }}
 
         run: python notion_sync.py
 
