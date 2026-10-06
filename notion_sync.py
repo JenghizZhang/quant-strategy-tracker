@@ -107,18 +107,18 @@ def notion_request(
 
 
 # ============================================================
-# FIND CURRENT STATUS ROW
+# FIND STRATEGY 1 STATUS ROW
 # ============================================================
 
 def find_current_status_page():
     """
-    Find the existing row whose title is:
+    Find the existing Current Status row whose Name is:
 
-        Current
+        Strategy 1
 
-    We UPDATE that page.
+    We UPDATE this page.
 
-    We do NOT create another Current row.
+    We do NOT create another row.
     """
 
     result = notion_request(
@@ -132,7 +132,7 @@ def find_current_status_page():
             "filter": {
                 "property": "Name",
                 "title": {
-                    "equals": "Current"
+                    "equals": "Strategy 1"
                 },
             },
             "page_size": 10,
@@ -148,7 +148,7 @@ def find_current_status_page():
 
         raise RuntimeError(
             "Could not find the "
-            "'Current' row in "
+            "'Strategy 1' row in "
             "Strategy 1 Current Status."
         )
 
@@ -156,7 +156,7 @@ def find_current_status_page():
 
         raise RuntimeError(
             "More than one row named "
-            "'Current' was found. "
+            "'Strategy 1' was found. "
             "Refusing to guess which "
             "one should be updated."
         )
@@ -177,7 +177,7 @@ def get_next_trading_day(
     Execute Date must therefore be the NEXT
     actual US trading session.
 
-    This automatically handles:
+    Handles:
     - weekends
     - holidays
     """
@@ -244,11 +244,11 @@ def build_data_source_text(
     data_sources,
 ):
     """
-    Example:
+    Examples:
 
     Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
 
-    If everything is daily:
+    or:
 
     Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
     """
@@ -365,7 +365,7 @@ def notion_date(
 
 
 # ============================================================
-# LOAD BACKTEST OUTPUT
+# LOAD STRATEGY OUTPUT
 # ============================================================
 
 def load_strategy_output():
@@ -406,19 +406,19 @@ def sync_current_status():
         load_strategy_output()
     )
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Signal Date
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     signal_date = status[
         "Signal Date"
     ]
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Execute Date
     #
     # Must be next ACTUAL trading day.
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     execute_date = (
         get_next_trading_day(
@@ -426,9 +426,9 @@ def sync_current_status():
         )
     )
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Human-readable data source
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     data_source_text = (
         build_data_source_text(
@@ -438,20 +438,17 @@ def sync_current_status():
         )
     )
 
-    # ----------------------------------------
-    # Find existing Notion row
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Find existing Strategy 1 row
+    # --------------------------------------------------------
 
     page_id = (
         find_current_status_page()
     )
 
-    # ----------------------------------------
+    # --------------------------------------------------------
     # Last Updated
-    #
-    # Store a real timestamp rather than
-    # only a date.
-    # ----------------------------------------
+    # --------------------------------------------------------
 
     last_updated = (
         pd.Timestamp.now(
@@ -459,6 +456,10 @@ def sync_current_status():
         )
         .isoformat()
     )
+
+    # --------------------------------------------------------
+    # Properties to update
+    # --------------------------------------------------------
 
     properties = {
 
@@ -567,9 +568,9 @@ def sync_current_status():
         ),
     }
 
-    # ----------------------------------------
-    # Update page
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # Update Notion row
+    # --------------------------------------------------------
 
     notion_request(
         "PATCH",
@@ -581,12 +582,21 @@ def sync_current_status():
         },
     )
 
+    # --------------------------------------------------------
+    # Console output
+    # --------------------------------------------------------
+
     print()
     print("=" * 70)
     print(
         "NOTION CURRENT STATUS"
     )
     print("=" * 70)
+
+    print(
+        "Name            :",
+        "Strategy 1",
+    )
 
     print(
         "Signal Date     :",
