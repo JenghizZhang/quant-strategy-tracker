@@ -1,0 +1,39 @@
+name: Backtest Strategy 2
+
+on:
+  # 第一阶段只做手动回测验证。
+  # 等 Strategy 2 逻辑确认无误、Notion 同步代码完成后，
+  # 再加自动 schedule。
+  workflow_dispatch:
+
+concurrency:
+  group: strategy2-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Strategy 2 backtest
+        run: python strategy2.py
+
+      - name: Upload Strategy 2 backtest results
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy2-backtest-results
+          path: output/
+          retention-days: 30
