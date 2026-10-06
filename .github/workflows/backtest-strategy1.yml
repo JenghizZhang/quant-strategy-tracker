@@ -61,6 +61,10 @@ jobs:
 
           ANNUAL_PERFORMANCE_DATA_SOURCE_ID: ${{ secrets.ANNUAL_PERFORMANCE_DATA_SOURCE_ID }}
 
+          NOTION_MAIN_PAGE_ID: ${{ secrets.NOTION_MAIN_PAGE_ID }}
+          
+          NOTION_MENTION_NAME: ${{ secrets.NOTION_MENTION_NAME }}
+
         run: python notion_sync.py
 
       - name: Upload backtest results
