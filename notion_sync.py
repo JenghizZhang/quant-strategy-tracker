@@ -30,11 +30,23 @@ MONTHLY_FILE = "output/strategy1_monthly.csv"
 
 NYSE = mcal.get_calendar("NYSE")
 
-# Avoid hammering the Notion API when the first sync
-# needs to update many rows.
 WRITE_DELAY_SECONDS = 0.35
 
-NUMBER_TOLERANCE = 1e-10
+
+# ============================================================
+# PERFORMANCE PRECISION
+#
+# Notion Percent stores decimal values:
+#
+# 0.0221 = 2.21%
+#
+# So keeping 4 decimal places in the stored decimal
+# gives us 2 decimal places in displayed percentage.
+# ============================================================
+
+PERFORMANCE_STORAGE_DECIMALS = 4
+
+NUMBER_TOLERANCE = 1e-12
 
 
 # ============================================================
@@ -49,7 +61,7 @@ def notion_request(
     """
     Make a Notion API request.
 
-    The token is never printed.
+    Never prints the token.
     """
 
     url = (
@@ -122,12 +134,13 @@ def query_all_pages(
     data_source_id,
 ):
     """
-    Query every row from a Notion data source.
+    Query all rows from a Notion data source.
 
     Handles pagination automatically.
     """
 
     pages = []
+
     start_cursor = None
 
     while True:
@@ -136,10 +149,13 @@ def query_all_pages(
             "page_size": 100,
         }
 
-        if start_cursor is not None:
-            body["start_cursor"] = (
-                start_cursor
-            )
+        if (
+            start_cursor
+            is not None
+        ):
+            body[
+                "start_cursor"
+            ] = start_cursor
 
         result = notion_request(
             "POST",
@@ -227,9 +243,66 @@ def notion_select(
 def notion_number(
     value,
 ):
+    """
+    General number.
+
+    Keep full precision for:
+    - NDX Close
+    - MA30
+    - MA50
+    - MA200
+    """
+
     return {
         "number": float(
             value
+        )
+    }
+
+
+def normalize_performance(
+    value,
+):
+    """
+    Normalize a return before writing/comparing.
+
+    Example:
+
+        0.02214202312929
+        ->
+        0.0221
+
+    Notion displays:
+
+        2.21%
+    """
+
+    value = float(
+        value
+    )
+
+    if not math.isfinite(
+        value
+    ):
+        raise ValueError(
+            f"Invalid performance value: "
+            f"{value}"
+        )
+
+    return round(
+        value,
+        PERFORMANCE_STORAGE_DECIMALS,
+    )
+
+
+def notion_performance_number(
+    value,
+):
+    return {
+        "number": (
+            normalize_performance(
+                value
+            )
         )
     }
 
@@ -266,8 +339,14 @@ def get_title_value(
 ):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
     title = prop.get(
@@ -286,7 +365,10 @@ def get_title_value(
             "plain_text"
         )
 
-        if plain_text is not None:
+        if (
+            plain_text
+            is not None
+        ):
             parts.append(
                 plain_text
             )
@@ -302,8 +384,14 @@ def get_number_value(
 ):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
     return prop.get(
@@ -317,8 +405,14 @@ def get_date_value(
 ):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
     date = prop.get(
@@ -341,10 +435,20 @@ def numbers_equal(
     current,
     expected,
 ):
+    """
+    expected is already normalized.
+
+    This forces old long-decimal Notion values
+    to be rewritten once.
+
+    After that, repeated runs remain stable.
+    """
+
     if current is None:
         return False
 
     try:
+
         current = float(
             current
         )
@@ -360,8 +464,13 @@ def numbers_equal(
         return False
 
     if (
-        not math.isfinite(current)
-        or not math.isfinite(expected)
+        not math.isfinite(
+            current
+        )
+        or
+        not math.isfinite(
+            expected
+        )
     ):
         return False
 
@@ -383,13 +492,21 @@ def dates_equal(
     try:
 
         current_date = (
-            pd.Timestamp(current)
-            .strftime("%Y-%m-%d")
+            pd.Timestamp(
+                current
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
 
         expected_date = (
-            pd.Timestamp(expected)
-            .strftime("%Y-%m-%d")
+            pd.Timestamp(
+                expected
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
 
         return (
@@ -402,7 +519,7 @@ def dates_equal(
 
 
 # ============================================================
-# CURRENT STATUS ROW
+# CURRENT STATUS
 # ============================================================
 
 def find_current_status_page():
@@ -410,8 +527,6 @@ def find_current_status_page():
     Find:
 
         Name = Strategy 1
-
-    inside Strategy 1 Current Status.
     """
 
     result = notion_request(
@@ -455,7 +570,9 @@ def find_current_status_page():
             "in Current Status."
         )
 
-    return pages[0]["id"]
+    return pages[0][
+        "id"
+    ]
 
 
 # ============================================================
@@ -466,10 +583,11 @@ def get_next_trading_day(
     signal_date,
 ):
     """
-    Signal is confirmed at today's close.
+    Signal:
+        today's close
 
-    Execution happens at the next actual
-    US market session open.
+    Execution:
+        next actual NYSE trading-day open
     """
 
     signal_date = (
@@ -481,17 +599,25 @@ def get_next_trading_day(
 
     start_date = (
         signal_date
-        + pd.Timedelta(days=1)
+        + pd.Timedelta(
+            days=1
+        )
     )
 
     end_date = (
         signal_date
-        + pd.Timedelta(days=14)
+        + pd.Timedelta(
+            days=14
+        )
     )
 
     schedule = NYSE.schedule(
-        start_date=start_date.date(),
-        end_date=end_date.date(),
+        start_date=(
+            start_date.date()
+        ),
+        end_date=(
+            end_date.date()
+        ),
     )
 
     if schedule.empty:
@@ -505,7 +631,9 @@ def get_next_trading_day(
         pd.Timestamp(
             schedule.index[0]
         )
-        .strftime("%Y-%m-%d")
+        .strftime(
+            "%Y-%m-%d"
+        )
     )
 
 
@@ -621,7 +749,7 @@ def load_strategy_output():
 
 
 # ============================================================
-# CURRENT STATUS SYNC
+# SYNC CURRENT STATUS
 # ============================================================
 
 def sync_current_status():
@@ -833,7 +961,7 @@ def sync_current_status():
 
 
 # ============================================================
-# LOAD MONTHLY RESULTS
+# LOAD MONTHLY PERFORMANCE
 # ============================================================
 
 def load_monthly_results():
@@ -877,7 +1005,9 @@ def load_monthly_results():
             "Monthly CSV missing "
             "required column(s): "
             + ", ".join(
-                sorted(missing)
+                sorted(
+                    missing
+                )
             )
         )
 
@@ -890,8 +1020,10 @@ def load_monthly_results():
         ]
     ].copy()
 
-    monthly = monthly.sort_values(
-        "Month"
+    monthly = (
+        monthly.sort_values(
+            "Month"
+        )
     )
 
     for column in [
@@ -920,11 +1052,34 @@ def load_monthly_results():
                 f"{bad_months}"
             )
 
+    # --------------------------------------------------------
+    # Normalize values only for Notion.
+    #
+    # CSV remains full precision.
+    # --------------------------------------------------------
+
+    for column in [
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    ]:
+
+        monthly[
+            column
+        ] = (
+            monthly[
+                column
+            ]
+            .map(
+                normalize_performance
+            )
+        )
+
     return monthly
 
 
 # ============================================================
-# MONTHLY NOTION ROW INDEX
+# EXISTING MONTH ROWS
 # ============================================================
 
 def get_existing_month_rows():
@@ -937,21 +1092,25 @@ def get_existing_month_rows():
             ...
         }
 
-    Duplicate Month titles are treated as
-    an error rather than guessed.
+    Duplicate month titles are treated
+    as an error.
     """
 
-    pages = query_all_pages(
-        STRATEGY1_MONTHLY_DATA_SOURCE_ID
+    pages = (
+        query_all_pages(
+            STRATEGY1_MONTHLY_DATA_SOURCE_ID
+        )
     )
 
     result = {}
 
     for page in pages:
 
-        month = get_title_value(
-            page,
-            "Month",
+        month = (
+            get_title_value(
+                page,
+                "Month",
+            )
         )
 
         if not month:
@@ -961,7 +1120,7 @@ def get_existing_month_rows():
 
             raise RuntimeError(
                 "Duplicate Monthly "
-                f"Performance row found: "
+                "Performance row found: "
                 f"{month}"
             )
 
@@ -973,7 +1132,7 @@ def get_existing_month_rows():
 
 
 # ============================================================
-# CREATE MONTHLY ROW
+# CREATE MONTH ROW
 # ============================================================
 
 def create_month_row(
@@ -983,12 +1142,8 @@ def create_month_row(
     qqq_return,
     spy_return,
 ):
-    """
-    Used automatically in future months if
-    the row does not already exist.
-    """
 
-    result = notion_request(
+    return notion_request(
         "POST",
         "pages",
         {
@@ -1000,6 +1155,7 @@ def create_month_row(
                     STRATEGY1_MONTHLY_DATA_SOURCE_ID
                 ),
             },
+
             "properties": {
 
                 "Month": (
@@ -1015,19 +1171,19 @@ def create_month_row(
                 ),
 
                 "Strategy 1": (
-                    notion_number(
+                    notion_performance_number(
                         strategy_return
                     )
                 ),
 
                 "QQQ": (
-                    notion_number(
+                    notion_performance_number(
                         qqq_return
                     )
                 ),
 
                 "SPY": (
-                    notion_number(
+                    notion_performance_number(
                         spy_return
                     )
                 ),
@@ -1035,11 +1191,9 @@ def create_month_row(
         },
     )
 
-    return result
-
 
 # ============================================================
-# UPDATE MONTHLY ROW
+# UPDATE MONTH ROW
 # ============================================================
 
 def update_month_row(
@@ -1049,6 +1203,7 @@ def update_month_row(
     qqq_return,
     spy_return,
 ):
+
     notion_request(
         "PATCH",
         f"pages/{page_id}",
@@ -1062,19 +1217,19 @@ def update_month_row(
                 ),
 
                 "Strategy 1": (
-                    notion_number(
+                    notion_performance_number(
                         strategy_return
                     )
                 ),
 
                 "QQQ": (
-                    notion_number(
+                    notion_performance_number(
                         qqq_return
                     )
                 ),
 
                 "SPY": (
-                    notion_number(
+                    notion_performance_number(
                         spy_return
                     )
                 ),
@@ -1084,7 +1239,7 @@ def update_month_row(
 
 
 # ============================================================
-# MONTHLY SYNC
+# SYNC MONTHLY PERFORMANCE
 # ============================================================
 
 def sync_monthly_performance():
@@ -1108,7 +1263,9 @@ def sync_monthly_performance():
     created = 0
     unchanged = 0
 
-    for _, row in monthly.iterrows():
+    for _, row in (
+        monthly.iterrows()
+    ):
 
         month = str(
             row["Month"]
@@ -1118,7 +1275,9 @@ def sync_monthly_performance():
             pd.Timestamp(
                 f"{month}-01"
             )
-            .strftime("%Y-%m-%d")
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
 
         strategy_return = float(
@@ -1133,21 +1292,30 @@ def sync_monthly_performance():
             row["SPY"]
         )
 
-        # ----------------------------------------------------
-        # Month does not yet exist in Notion
-        # ----------------------------------------------------
+        # ====================================================
+        # CREATE NEW MONTH
+        # ====================================================
 
-        if month not in existing:
+        if (
+            month
+            not in existing
+        ):
 
             create_month_row(
                 month=month,
-                month_start=month_start,
+
+                month_start=(
+                    month_start
+                ),
+
                 strategy_return=(
                     strategy_return
                 ),
+
                 qqq_return=(
                     qqq_return
                 ),
+
                 spy_return=(
                     spy_return
                 ),
@@ -1165,9 +1333,9 @@ def sync_monthly_performance():
 
             continue
 
-        # ----------------------------------------------------
-        # Existing Notion row
-        # ----------------------------------------------------
+        # ====================================================
+        # EXISTING MONTH
+        # ====================================================
 
         page = existing[
             month
@@ -1202,30 +1370,37 @@ def sync_monthly_performance():
         )
 
         is_same = (
+
             dates_equal(
                 current_month_start,
                 month_start,
             )
+
             and
+
             numbers_equal(
                 current_strategy,
                 strategy_return,
             )
+
             and
+
             numbers_equal(
                 current_qqq,
                 qqq_return,
             )
+
             and
+
             numbers_equal(
                 current_spy,
                 spy_return,
             )
         )
 
-        # ----------------------------------------------------
-        # Nothing changed
-        # ----------------------------------------------------
+        # ====================================================
+        # UNCHANGED
+        # ====================================================
 
         if is_same:
 
@@ -1233,19 +1408,27 @@ def sync_monthly_performance():
 
             continue
 
-        # ----------------------------------------------------
-        # Update changed / blank values
-        # ----------------------------------------------------
+        # ====================================================
+        # UPDATE
+        # ====================================================
 
         update_month_row(
-            page_id=page["id"],
-            month_start=month_start,
+            page_id=(
+                page["id"]
+            ),
+
+            month_start=(
+                month_start
+            ),
+
             strategy_return=(
                 strategy_return
             ),
+
             qqq_return=(
                 qqq_return
             ),
+
             spy_return=(
                 spy_return
             ),
@@ -1265,7 +1448,9 @@ def sync_monthly_performance():
 
     print(
         "Monthly rows in backtest :",
-        len(monthly),
+        len(
+            monthly
+        ),
     )
 
     print(
@@ -1312,7 +1497,8 @@ def main():
     print("=" * 70)
 
     print(
-        "✅ Strategy 1 Notion sync completed"
+        "✅ Strategy 1 "
+        "Notion sync completed"
     )
 
     print("=" * 70)
