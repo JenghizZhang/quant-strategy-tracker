@@ -59,8 +59,11 @@ from market_data import (
 #   From first trading day of 2016
 #
 # Warm-up/state construction:
-#   Starts from 2010 historical data so that the state on
+#   The state machine starts from CASH on the earliest valid signal date.
+#   It then runs from 2010 historical data so that the state on
 #   2016-01-01 is established by several years of prior cross events.
+#   CASH is only the seed state; after the first valid entry, normal
+#   QQQ / SPY / AGG transitions apply and exits go to AGG.
 #
 # Latest market data priority is handled in market_data.py:
 #   Daily
@@ -83,6 +86,7 @@ ASSETS = [
 ]
 
 DEFENSIVE_ASSET = "AGG"
+INITIAL_HOLDING = "CASH"
 OUTPUT_DIR = Path("output")
 
 
@@ -197,7 +201,7 @@ def build_signals(ndx, spx):
 
 def apply_state_machine(
     signals,
-    initial_holding=DEFENSIVE_ASSET,
+    initial_holding=INITIAL_HOLDING,
 ):
     """
     Convert cross events into portfolio decisions.
@@ -208,6 +212,10 @@ def apply_state_machine(
     Direct QQQ <-> SPY switching is only allowed when the current
     holding exits AND the other holding triggers a fresh entry on
     the exact same signal day.
+
+    The earliest state is CASH. CASH waits for the first valid entry
+    event and is never used as the normal defensive state; exits from
+    QQQ/SPY go to AGG.
     """
 
     result = signals.copy()
@@ -303,6 +311,37 @@ def apply_state_machine(
                 next_holding = "SPY"
                 reason = (
                     "Hold SPY — no SPX MA50/MA200 down-cross"
+                )
+
+        # ====================================================
+        # INITIAL SEED STATE: CASH
+        # ====================================================
+
+        elif holding_at_close == INITIAL_HOLDING:
+
+            # CASH is only the seed state. It waits for a fresh, valid
+            # entry event. Once the strategy leaves CASH, exits go to AGG
+            # and the state machine never intentionally returns to CASH.
+            if ndx_cross_up:
+                next_holding = "QQQ"
+                reason = (
+                    "NDX crossed above MA30 → initial QQQ entry"
+                )
+
+            elif (
+                spx_cross_up
+                and not ndx_above
+            ):
+                next_holding = "SPY"
+                reason = (
+                    "SPX MA50 crossed above MA200 and "
+                    "NDX <= MA30 → initial SPY entry"
+                )
+
+            else:
+                next_holding = INITIAL_HOLDING
+                reason = (
+                    "No new valid initial entry cross → stay CASH"
                 )
 
         # ====================================================
@@ -655,52 +694,56 @@ def run_backtest(
 
         if previous_date is None:
 
-            old_holding = "CASH"
+            old_holding = INITIAL_HOLDING
             holding = target
 
-            open_price = (
-                prices[holding]
-                .at[
-                    date,
-                    "Open",
-                ]
-            )
+            # CASH has a zero return. This is mainly a safety path in
+            # case the warm-up period has not produced an entry by the
+            # first reported backtest date.
+            if holding != INITIAL_HOLDING:
+                open_price = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Open",
+                    ]
+                )
 
-            close_price = (
-                prices[holding]
-                .at[
-                    date,
-                    "Close",
-                ]
-            )
+                close_price = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Close",
+                    ]
+                )
 
-            equity *= (
-                close_price
-                / open_price
-            )
+                equity *= (
+                    close_price
+                    / open_price
+                )
 
-            position_history.append(
-                {
-                    "Change": (
-                        f"{old_holding} → {holding}"
-                    ),
-                    "Signal Date": (
-                        signal_date
-                    ),
-                    "Execute Date": (
-                        date
-                    ),
-                    "From": (
-                        old_holding
-                    ),
-                    "To": (
-                        holding
-                    ),
-                    "Reason": (
-                        reason
-                    ),
-                }
-            )
+                position_history.append(
+                    {
+                        "Change": (
+                            f"{old_holding} → {holding}"
+                        ),
+                        "Signal Date": (
+                            signal_date
+                        ),
+                        "Execute Date": (
+                            date
+                        ),
+                        "From": (
+                            old_holding
+                        ),
+                        "To": (
+                            holding
+                        ),
+                        "Reason": (
+                            reason
+                        ),
+                    }
+                )
 
         # ====================================================
         # LATER TRADING DAYS
@@ -712,26 +755,27 @@ def run_backtest(
             # Overnight return belongs to OLD position.
             # ------------------------------------------------
 
-            old_open = (
-                prices[holding]
-                .at[
-                    date,
-                    "Open",
-                ]
-            )
+            if holding != INITIAL_HOLDING:
+                old_open = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Open",
+                    ]
+                )
 
-            old_previous_close = (
-                prices[holding]
-                .at[
-                    previous_date,
-                    "Close",
-                ]
-            )
+                old_previous_close = (
+                    prices[holding]
+                    .at[
+                        previous_date,
+                        "Close",
+                    ]
+                )
 
-            equity *= (
-                old_open
-                / old_previous_close
-            )
+                equity *= (
+                    old_open
+                    / old_previous_close
+                )
 
             # ------------------------------------------------
             # Switch at today's open if yesterday's signal changed.
@@ -769,26 +813,27 @@ def run_backtest(
             # Intraday return belongs to NEW/current position.
             # ------------------------------------------------
 
-            current_open = (
-                prices[holding]
-                .at[
-                    date,
-                    "Open",
-                ]
-            )
+            if holding != INITIAL_HOLDING:
+                current_open = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Open",
+                    ]
+                )
 
-            current_close = (
-                prices[holding]
-                .at[
-                    date,
-                    "Close",
-                ]
-            )
+                current_close = (
+                    prices[holding]
+                    .at[
+                        date,
+                        "Close",
+                    ]
+                )
 
-            equity *= (
-                current_close
-                / current_open
-            )
+                equity *= (
+                    current_close
+                    / current_open
+                )
 
         decision_today = decisions.loc[
             date
