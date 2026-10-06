@@ -36,12 +36,13 @@ WRITE_DELAY_SECONDS = 0.35
 # ============================================================
 # PERFORMANCE PRECISION
 #
-# Notion Percent stores decimal values:
+# Notion percent stores decimals:
 #
-# 0.0221 = 2.21%
+# 0.022210 = 2.2210%
 #
-# So keeping 4 decimal places in the stored decimal
-# gives us 2 decimal places in displayed percentage.
+# 6 stored decimal places
+# =
+# 4 displayed percentage decimal places
 # ============================================================
 
 PERFORMANCE_STORAGE_DECIMALS = 6
@@ -61,7 +62,7 @@ def notion_request(
     """
     Make a Notion API request.
 
-    Never prints the token.
+    Token is never printed.
     """
 
     url = (
@@ -130,66 +131,6 @@ def notion_request(
         ) from e
 
 
-def query_all_pages(
-    data_source_id,
-):
-    """
-    Query all rows from a Notion data source.
-
-    Handles pagination automatically.
-    """
-
-    pages = []
-
-    start_cursor = None
-
-    while True:
-
-        body = {
-            "page_size": 100,
-        }
-
-        if (
-            start_cursor
-            is not None
-        ):
-            body[
-                "start_cursor"
-            ] = start_cursor
-
-        result = notion_request(
-            "POST",
-            (
-                "data_sources/"
-                f"{data_source_id}"
-                "/query"
-            ),
-            body,
-        )
-
-        pages.extend(
-            result.get(
-                "results",
-                [],
-            )
-        )
-
-        if not result.get(
-            "has_more",
-            False,
-        ):
-            break
-
-        start_cursor = result.get(
-            "next_cursor"
-        )
-
-        if not start_cursor:
-            break
-
-    return pages
-
-
 # ============================================================
 # PROPERTY BUILDERS
 # ============================================================
@@ -244,13 +185,9 @@ def notion_number(
     value,
 ):
     """
-    General number.
-
-    Keep full precision for:
-    - NDX Close
-    - MA30
-    - MA50
-    - MA200
+    General numeric values such as:
+    - index close
+    - moving averages
     """
 
     return {
@@ -264,17 +201,14 @@ def normalize_performance(
     value,
 ):
     """
-    Normalize a return before writing/comparing.
-
     Example:
 
-        0.02214202312929
-        ->
-        0.0221
+    0.022210483...
+    ->
+    0.022210
 
-    Notion displays:
-
-        2.21%
+    Notion:
+    2.2210%
     """
 
     value = float(
@@ -333,51 +267,6 @@ def notion_date(
 # PROPERTY READERS
 # ============================================================
 
-def get_title_value(
-    page,
-    property_name,
-):
-    prop = (
-        page
-        .get(
-            "properties",
-            {},
-        )
-        .get(
-            property_name,
-            {},
-        )
-    )
-
-    title = prop.get(
-        "title",
-        [],
-    )
-
-    if not title:
-        return None
-
-    parts = []
-
-    for item in title:
-
-        plain_text = item.get(
-            "plain_text"
-        )
-
-        if (
-            plain_text
-            is not None
-        ):
-            parts.append(
-                plain_text
-            )
-
-    return "".join(
-        parts
-    )
-
-
 def get_number_value(
     page,
     property_name,
@@ -435,15 +324,6 @@ def numbers_equal(
     current,
     expected,
 ):
-    """
-    expected is already normalized.
-
-    This forces old long-decimal Notion values
-    to be rewritten once.
-
-    After that, repeated runs remain stable.
-    """
-
     if current is None:
         return False
 
@@ -519,7 +399,7 @@ def dates_equal(
 
 
 # ============================================================
-# CURRENT STATUS
+# CURRENT STATUS ROW
 # ============================================================
 
 def find_current_status_page():
@@ -565,14 +445,12 @@ def find_current_status_page():
     if len(pages) > 1:
 
         raise RuntimeError(
-            "More than one row named "
-            "'Strategy 1' was found "
+            "More than one "
+            "'Strategy 1' row found "
             "in Current Status."
         )
 
-    return pages[0][
-        "id"
-    ]
+    return pages[0]["id"]
 
 
 # ============================================================
@@ -587,7 +465,7 @@ def get_next_trading_day(
         today's close
 
     Execution:
-        next actual NYSE trading-day open
+        next actual US trading-day open
     """
 
     signal_date = (
@@ -660,11 +538,13 @@ def build_data_source_text(
     data_sources,
 ):
     """
-    Examples:
-
-    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
+    Example:
 
     Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
+
+    or:
+
+    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
     """
 
     order = [
@@ -717,7 +597,7 @@ def build_data_source_text(
 
 
 # ============================================================
-# LOAD STRATEGY OUTPUT
+# LOAD STRATEGY STATUS
 # ============================================================
 
 def load_strategy_output():
@@ -749,7 +629,7 @@ def load_strategy_output():
 
 
 # ============================================================
-# SYNC CURRENT STATUS
+# CURRENT STATUS SYNC
 # ============================================================
 
 def sync_current_status():
@@ -961,21 +841,14 @@ def sync_current_status():
 
 
 # ============================================================
-# LOAD MONTHLY PERFORMANCE
+# MONTHLY RESULTS
 # ============================================================
 
 def load_monthly_results():
     """
-    Read:
-
-        output/strategy1_monthly.csv
-
-    Expected columns:
-
-        Month
-        Strategy 1
-        QQQ
-        SPY
+    Full CSV remains available,
+    but Notion only syncs the latest
+    two months.
     """
 
     monthly = pd.read_csv(
@@ -1020,10 +893,8 @@ def load_monthly_results():
         ]
     ].copy()
 
-    monthly = (
-        monthly.sort_values(
-            "Month"
-        )
+    monthly = monthly.sort_values(
+        "Month"
     )
 
     for column in [
@@ -1052,83 +923,59 @@ def load_monthly_results():
                 f"{bad_months}"
             )
 
-    # --------------------------------------------------------
-    # Normalize values only for Notion.
-    #
-    # CSV remains full precision.
-    # --------------------------------------------------------
-
-    for column in [
-        "Strategy 1",
-        "QQQ",
-        "SPY",
-    ]:
-
-        monthly[
-            column
-        ] = (
-            monthly[
-                column
-            ]
-            .map(
-                normalize_performance
-            )
-        )
-
     return monthly
 
 
 # ============================================================
-# EXISTING MONTH ROWS
+# FIND ONE MONTH ROW
 # ============================================================
 
-def get_existing_month_rows():
+def find_month_page(
+    month,
+):
     """
-    Return:
+    Search only one Month row.
 
+    Returns:
+        page
+        or None
+    """
+
+    result = notion_request(
+        "POST",
+        (
+            "data_sources/"
+            f"{STRATEGY1_MONTHLY_DATA_SOURCE_ID}"
+            "/query"
+        ),
         {
-            "2026-10": page,
-            "2026-09": page,
-            ...
-        }
-
-    Duplicate month titles are treated
-    as an error.
-    """
-
-    pages = (
-        query_all_pages(
-            STRATEGY1_MONTHLY_DATA_SOURCE_ID
-        )
+            "filter": {
+                "property": "Month",
+                "title": {
+                    "equals": month
+                },
+            },
+            "page_size": 10,
+        },
     )
 
-    result = {}
+    pages = result.get(
+        "results",
+        [],
+    )
 
-    for page in pages:
+    if len(pages) > 1:
 
-        month = (
-            get_title_value(
-                page,
-                "Month",
-            )
+        raise RuntimeError(
+            "Duplicate Monthly "
+            "Performance rows found: "
+            f"{month}"
         )
 
-        if not month:
-            continue
+    if len(pages) == 0:
+        return None
 
-        if month in result:
-
-            raise RuntimeError(
-                "Duplicate Monthly "
-                "Performance row found: "
-                f"{month}"
-            )
-
-        result[
-            month
-        ] = page
-
-    return result
+    return pages[0]
 
 
 # ============================================================
@@ -1239,183 +1086,64 @@ def update_month_row(
 
 
 # ============================================================
-# SYNC MONTHLY PERFORMANCE
+# SYNC ONE MONTH
 # ============================================================
 
-def sync_monthly_performance():
+def sync_one_month(
+    row,
+):
 
-    print()
-    print("=" * 70)
-    print(
-        "NOTION MONTHLY PERFORMANCE"
-    )
-    print("=" * 70)
-
-    monthly = (
-        load_monthly_results()
+    month = str(
+        row["Month"]
     )
 
-    existing = (
-        get_existing_month_rows()
+    month_start = (
+        pd.Timestamp(
+            f"{month}-01"
+        )
+        .strftime(
+            "%Y-%m-%d"
+        )
     )
 
-    updated = 0
-    created = 0
-    unchanged = 0
-
-    for _, row in (
-        monthly.iterrows()
-    ):
-
-        month = str(
-            row["Month"]
+    strategy_return = (
+        normalize_performance(
+            row[
+                "Strategy 1"
+            ]
         )
+    )
 
-        month_start = (
-            pd.Timestamp(
-                f"{month}-01"
-            )
-            .strftime(
-                "%Y-%m-%d"
-            )
+    qqq_return = (
+        normalize_performance(
+            row[
+                "QQQ"
+            ]
         )
+    )
 
-        strategy_return = float(
-            row["Strategy 1"]
+    spy_return = (
+        normalize_performance(
+            row[
+                "SPY"
+            ]
         )
+    )
 
-        qqq_return = float(
-            row["QQQ"]
-        )
-
-        spy_return = float(
-            row["SPY"]
-        )
-
-        # ====================================================
-        # CREATE NEW MONTH
-        # ====================================================
-
-        if (
+    page = (
+        find_month_page(
             month
-            not in existing
-        ):
-
-            create_month_row(
-                month=month,
-
-                month_start=(
-                    month_start
-                ),
-
-                strategy_return=(
-                    strategy_return
-                ),
-
-                qqq_return=(
-                    qqq_return
-                ),
-
-                spy_return=(
-                    spy_return
-                ),
-            )
-
-            created += 1
-
-            print(
-                f"➕ {month}: created"
-            )
-
-            time.sleep(
-                WRITE_DELAY_SECONDS
-            )
-
-            continue
-
-        # ====================================================
-        # EXISTING MONTH
-        # ====================================================
-
-        page = existing[
-            month
-        ]
-
-        current_month_start = (
-            get_date_value(
-                page,
-                "Month Start",
-            )
         )
+    )
 
-        current_strategy = (
-            get_number_value(
-                page,
-                "Strategy 1",
-            )
-        )
+    # --------------------------------------------------------
+    # New month
+    # --------------------------------------------------------
 
-        current_qqq = (
-            get_number_value(
-                page,
-                "QQQ",
-            )
-        )
+    if page is None:
 
-        current_spy = (
-            get_number_value(
-                page,
-                "SPY",
-            )
-        )
-
-        is_same = (
-
-            dates_equal(
-                current_month_start,
-                month_start,
-            )
-
-            and
-
-            numbers_equal(
-                current_strategy,
-                strategy_return,
-            )
-
-            and
-
-            numbers_equal(
-                current_qqq,
-                qqq_return,
-            )
-
-            and
-
-            numbers_equal(
-                current_spy,
-                spy_return,
-            )
-        )
-
-        # ====================================================
-        # UNCHANGED
-        # ====================================================
-
-        if is_same:
-
-            unchanged += 1
-
-            continue
-
-        # ====================================================
-        # UPDATE
-        # ====================================================
-
-        update_month_row(
-            page_id=(
-                page["id"]
-            ),
+        create_month_row(
+            month=month,
 
             month_start=(
                 month_start
@@ -1434,11 +1162,187 @@ def sync_monthly_performance():
             ),
         )
 
-        updated += 1
+        print(
+            f"➕ {month}: created"
+        )
+
+        return "created"
+
+    # --------------------------------------------------------
+    # Existing month
+    # --------------------------------------------------------
+
+    current_month_start = (
+        get_date_value(
+            page,
+            "Month Start",
+        )
+    )
+
+    current_strategy = (
+        get_number_value(
+            page,
+            "Strategy 1",
+        )
+    )
+
+    current_qqq = (
+        get_number_value(
+            page,
+            "QQQ",
+        )
+    )
+
+    current_spy = (
+        get_number_value(
+            page,
+            "SPY",
+        )
+    )
+
+    is_same = (
+
+        dates_equal(
+            current_month_start,
+            month_start,
+        )
+
+        and
+
+        numbers_equal(
+            current_strategy,
+            strategy_return,
+        )
+
+        and
+
+        numbers_equal(
+            current_qqq,
+            qqq_return,
+        )
+
+        and
+
+        numbers_equal(
+            current_spy,
+            spy_return,
+        )
+    )
+
+    if is_same:
 
         print(
-            f"✏️ {month}: updated"
+            f"⏭️ {month}: unchanged"
         )
+
+        return "unchanged"
+
+    update_month_row(
+        page_id=(
+            page["id"]
+        ),
+
+        month_start=(
+            month_start
+        ),
+
+        strategy_return=(
+            strategy_return
+        ),
+
+        qqq_return=(
+            qqq_return
+        ),
+
+        spy_return=(
+            spy_return
+        ),
+    )
+
+    print(
+        f"✏️ {month}: updated"
+    )
+
+    return "updated"
+
+
+# ============================================================
+# SYNC RECENT MONTHLY PERFORMANCE
+# ============================================================
+
+def sync_monthly_performance():
+
+    print()
+    print("=" * 70)
+    print(
+        "NOTION MONTHLY PERFORMANCE"
+    )
+    print("=" * 70)
+
+    monthly = (
+        load_monthly_results()
+    )
+
+    if monthly.empty:
+
+        raise RuntimeError(
+            "Monthly performance CSV is empty."
+        )
+
+    # --------------------------------------------------------
+    # Only latest month + previous month.
+    #
+    # Example:
+    #
+    # latest = 2026-10
+    #
+    # sync:
+    # 2026-09
+    # 2026-10
+    # --------------------------------------------------------
+
+    recent = (
+        monthly
+        .tail(2)
+        .copy()
+    )
+
+    updated = 0
+    created = 0
+    unchanged = 0
+
+    print(
+        "Checking months:"
+    )
+
+    for month in recent[
+        "Month"
+    ]:
+
+        print(
+            f"  {month}"
+        )
+
+    print()
+
+    for _, row in (
+        recent.iterrows()
+    ):
+
+        result = (
+            sync_one_month(
+                row
+            )
+        )
+
+        if result == "updated":
+            updated += 1
+
+        elif result == "created":
+            created += 1
+
+        elif result == "unchanged":
+            unchanged += 1
 
         time.sleep(
             WRITE_DELAY_SECONDS
@@ -1447,31 +1351,31 @@ def sync_monthly_performance():
     print()
 
     print(
-        "Monthly rows in backtest :",
+        "Months checked :",
         len(
-            monthly
+            recent
         ),
     )
 
     print(
-        "Updated                  :",
+        "Updated        :",
         updated,
     )
 
     print(
-        "Created                  :",
+        "Created        :",
         created,
     )
 
     print(
-        "Unchanged                :",
+        "Unchanged      :",
         unchanged,
     )
 
     print()
 
     print(
-        "✅ Strategy 1 Monthly "
+        "✅ Recent Strategy 1 Monthly "
         "Performance synced to Notion"
     )
 
@@ -1490,7 +1394,7 @@ def main():
     # 1. Current Status
     sync_current_status()
 
-    # 2. Monthly Performance
+    # 2. Latest month + previous month
     sync_monthly_performance()
 
     print()
