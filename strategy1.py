@@ -47,13 +47,12 @@ from market_data import (
 #   AGG -> QQQ : QQQ fresh entry event
 #   AGG -> SPY : SPY fresh entry event
 #   QQQ -> AGG : QQQ exit event, unless same-day SPY fresh entry
-#   SPY -> AGG : SPY condition becomes invalid, unless same-day QQQ fresh entry
+#   SPY -> AGG : SPY condition becomes invalid (always; no direct SPY -> QQQ)
 #
-# Direct QQQ <-> SPY is allowed ONLY when, on the SAME signal day:
-#   QQQ -> SPY:
+# Direct switching rule:
+#   QQQ -> SPY is allowed ONLY when, on the SAME signal day:
 #       QQQ fresh exit + SPY fresh entry
-#   SPY -> QQQ:
-#       SPY becomes invalid + QQQ fresh entry
+#   SPY -> QQQ is NEVER allowed. SPY must first exit to AGG.
 #
 # If the other condition was already true before today but did not
 # just trigger an entry cross today, direct switching is NOT allowed.
@@ -237,8 +236,10 @@ def apply_state_machine(
         QQQ -> SPY only when QQQ exits and SPY has a fresh entry
         on the same signal day.
 
-        SPY -> QQQ only when SPY becomes invalid and QQQ has a
-        fresh entry on the same signal day.
+        SPY -> QQQ is never allowed. If SPY becomes invalid, it
+        always exits to AGG. Any QQQ cross-up on that same day is
+        intentionally missed; AGG must wait for a future fresh
+        QQQ cross-up before entering QQQ.
 
     CASH is only the seed state. After the strategy first leaves CASH,
     normal defensive exits go to AGG and the state machine never
@@ -333,43 +334,32 @@ def apply_state_machine(
             # SPY must continuously satisfy BOTH conditions:
             #   NDX <= MA30
             #   SPX MA50 > MA200
-            # If either becomes false, SPY exits.
+            # If either becomes false, SPY ALWAYS exits to AGG.
+            # Even if NDX fresh-crosses above MA30 on the same day,
+            # direct SPY -> QQQ is forbidden. That QQQ entry event is
+            # intentionally missed while SPY exits to AGG.
             if not spy_ok:
+                next_holding = DEFENSIVE_ASSET
 
-                # If NDX itself fresh-crossed above MA30 today,
-                # SPY becomes invalid and QQQ gets a fresh entry
-                # on the same signal day, so direct SPY -> QQQ
-                # is legal.
-                if ndx_cross_up:
-                    next_holding = "QQQ"
+                if ndx_above:
                     reason = (
-                        "SPY condition became invalid because "
-                        "NDX crossed above MA30, and QQQ received "
-                        "a fresh entry on the same day "
-                        "→ SPY → QQQ"
+                        "SPY condition invalid: NDX > MA30 "
+                        f"→ SPY exit → {DEFENSIVE_ASSET}; "
+                        "direct SPY → QQQ is not allowed"
                     )
-
+                elif not spx_above:
+                    reason = (
+                        "SPY condition invalid: "
+                        "SPX MA50 <= MA200 "
+                        f"→ SPY exit → {DEFENSIVE_ASSET}"
+                    )
                 else:
-                    next_holding = DEFENSIVE_ASSET
-
-                    if ndx_above:
-                        reason = (
-                            "SPY condition invalid: NDX > MA30 "
-                            f"→ SPY exit → {DEFENSIVE_ASSET}"
-                        )
-                    elif not spx_above:
-                        reason = (
-                            "SPY condition invalid: "
-                            "SPX MA50 <= MA200 "
-                            f"→ SPY exit → {DEFENSIVE_ASSET}"
-                        )
-                    else:
-                        # Defensive safety branch; logically spy_ok=False
-                        # must be explained by one of the conditions above.
-                        reason = (
-                            "SPY AND condition became invalid "
-                            f"→ SPY exit → {DEFENSIVE_ASSET}"
-                        )
+                    # Defensive safety branch; logically spy_ok=False
+                    # must be explained by one of the conditions above.
+                    reason = (
+                        "SPY AND condition became invalid "
+                        f"→ SPY exit → {DEFENSIVE_ASSET}"
+                    )
 
             else:
                 next_holding = "SPY"
@@ -492,9 +482,8 @@ def validate_state_machine(
         valid SPY fresh entry ==
             SPX Cross Up == True AND NDX <= MA30
 
-    SPY -> QQQ is legal only if the same signal day contains:
-        SPY condition invalid
-        NDX Cross Up == True
+    SPY -> QQQ is never legal. SPY invalidation must go to AGG,
+    even if NDX Cross Up == True on that same signal day.
 
     QQQ -> AGG requires a QQQ fresh exit.
     SPY -> AGG requires the SPY AND condition to be invalid.
@@ -618,17 +607,13 @@ def validate_state_machine(
 
             if new_holding == "QQQ":
                 spy_to_qqq += 1
-
-                if not (
-                    (not spy_ok)
-                    and ndx_cross_up
-                ):
-                    raise RuntimeError(
-                        "Illegal SPY -> QQQ switch on "
-                        f"{signal_date.date()}. "
-                        "Direct switching requires same-day "
-                        "SPY invalidation + fresh QQQ entry."
-                    )
+                raise RuntimeError(
+                    "Illegal SPY -> QQQ switch on "
+                    f"{signal_date.date()}. "
+                    "Strategy 1 requires every SPY invalidation "
+                    "to exit to AGG first; direct SPY -> QQQ "
+                    "is never allowed."
+                )
 
             elif new_holding == DEFENSIVE_ASSET:
                 if spy_ok:
@@ -1746,14 +1731,14 @@ def main():
         ],
     )
     print(
-        "Direct SPY -> QQQ switches :",
+        "Forbidden SPY -> QQQ switches:",
         validation[
             "SPY -> QQQ"
         ],
     )
     print(
-        "✅ Every direct QQQ/SPY switch "
-        "passed same-day exit + entry validation"
+        "✅ QQQ -> SPY requires same-day QQQ exit + fresh SPY entry; "
+        "SPY -> QQQ is forbidden"
     )
 
     print()
