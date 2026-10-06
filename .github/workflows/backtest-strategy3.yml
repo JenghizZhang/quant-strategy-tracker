@@ -1,0 +1,38 @@
+name: Backtest Strategy 3
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Strategy 3 backtest
+        run: python strategy3.py
+
+      - name: Upload Strategy 3 output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: strategy3-output
+          path: output/strategy3_*
+          if-no-files-found: warn
