@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
+from pathlib import Path
 from typing import Any
 from urllib import error, request
 
@@ -13,33 +15,28 @@ from strategy3_notion import build_notion_payload
 # ============================================================
 # Strategy 3 — Notion Sync
 #
-# Syncs ONLY Strategy 3's own four databases:
+# Syncs Strategy 3's own four databases:
 #   1) Current Status
 #   2) Monthly Performance
 #   3) Annual Performance
 #   4) Position History
 #
-# It does NOT touch:
-#   - Main Current Positions
-#   - Main Strategy Overview
-#   - Main Annual Performance
-#   - Strategy 1 / Strategy 2 pages
+# ALSO syncs Strategy 3 into the three shared/main tables:
+#   5) Main Current Positions
+#   6) Strategy Overview
+#   7) Main Annual Performance
+#
+# It only writes Strategy 3's row/column in shared tables.
+# It does NOT overwrite Strategy 1 / Strategy 2 values.
 #
 # Required secret:
 #   NOTION_TOKEN
 #
 # Optional env:
-#   FULL_REBUILD=true
+#   FULL_REBUILD=true|false
 #
-# FULL_REBUILD=true:
-#   - checks the complete backtest history
-#   - creates missing rows
-#   - updates changed rows
-#   - archives stale rows that no longer exist in the new backtest
-#
-# FULL_REBUILD=false:
-#   - still performs safe upserts
-#   - does NOT archive stale historical rows
+# Recommended normal setting:
+#   FULL_REBUILD=false
 # ============================================================
 
 
@@ -47,15 +44,33 @@ NOTION_VERSION = "2025-09-03"
 NOTION_API_BASE = "https://api.notion.com/v1"
 
 FULL_REBUILD = os.getenv("FULL_REBUILD", "false").strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
+    "1", "true", "yes", "y", "on"
 }
 
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 5
+
+OUTPUT_DIR = Path("output")
+SUMMARY_FILE = OUTPUT_DIR / "strategy3_summary.json"
+
+
+# ------------------------------------------------------------
+# Strategy 3 private data sources
+# ------------------------------------------------------------
+
+STRATEGY3_CURRENT_STATUS_DS = "a88a3950-4020-44b9-aabc-fd5c21d4fdd4"
+STRATEGY3_MONTHLY_DS = "28dc31b7-c9d2-43bf-a79d-3903b800f797"
+STRATEGY3_ANNUAL_DS = "4d036f51-4bef-4b38-8cff-db9f86a9ffa6"
+STRATEGY3_HISTORY_DS = "7546cee8-11ab-4575-9806-d5872ba6a7dc"
+
+
+# ------------------------------------------------------------
+# Shared/main data sources
+# ------------------------------------------------------------
+
+MAIN_CURRENT_POSITIONS_DS = "ca90d024-d1b0-4679-b1d7-12973dea12b3"
+MAIN_STRATEGY_OVERVIEW_DS = "c77336af-8286-4235-af16-b931725657f3"
+MAIN_ANNUAL_PERFORMANCE_DS = "05cb4313-a653-4424-b6e4-08b1514dc783"
 
 
 # ============================================================
@@ -103,7 +118,6 @@ def notion_request(
         except error.HTTPError as exc:
             details = exc.read().decode("utf-8", errors="replace")
 
-            # Rate limit / temporary server errors: retry.
             if exc.code == 429 or 500 <= exc.code <= 599:
                 last_error = RuntimeError(
                     f"Notion API HTTP {exc.code}: {details}"
@@ -149,7 +163,7 @@ def notion_request(
 
 
 # ============================================================
-# NOTION PROPERTY BUILDERS
+# PROPERTY BUILDERS
 # ============================================================
 
 def prop_title(value: Any) -> dict:
@@ -166,12 +180,7 @@ def prop_title(value: Any) -> dict:
 
 def prop_rich_text(value: Any) -> dict:
     text = "" if value is None else str(value)
-
-    # Notion rich-text items have a per-item character limit.
-    # Reasons/Data Source are short, but split defensively.
-    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)]
-    if not chunks:
-        chunks = [""]
+    chunks = [text[i:i + 1900] for i in range(0, len(text), 1900)] or [""]
 
     return {
         "rich_text": [
@@ -198,14 +207,362 @@ def prop_select(value: Any) -> dict:
     return {"select": {"name": str(value)}}
 
 
+def prop_status(value: Any) -> dict:
+    if value is None or str(value).strip() == "":
+        return {"status": None}
+    return {"status": {"name": str(value)}}
+
+
 def prop_date(value: Any) -> dict:
     if value is None or str(value).strip() == "":
         return {"date": None}
     return {"date": {"start": str(value)}}
 
 
+def build_property_for_type(prop_type: str, value: Any) -> dict:
+    if prop_type == "title":
+        return prop_title(value)
+    if prop_type == "rich_text":
+        return prop_rich_text(value)
+    if prop_type == "number":
+        return prop_number(value)
+    if prop_type == "checkbox":
+        return prop_checkbox(value)
+    if prop_type == "select":
+        return prop_select(value)
+    if prop_type == "status":
+        return prop_status(value)
+    if prop_type == "date":
+        return prop_date(value)
+
+    raise RuntimeError(
+        f"Unsupported Notion property type for sync: {prop_type}"
+    )
+
+
 # ============================================================
-# RECORD -> NOTION PROPERTY MAPS
+# BASIC NOTION HELPERS
+# ============================================================
+
+def query_all_pages(data_source_id: str) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    start_cursor = None
+
+    while True:
+        payload: dict[str, Any] = {"page_size": 100}
+
+        if start_cursor:
+            payload["start_cursor"] = start_cursor
+
+        response = notion_request(
+            "POST",
+            f"/data_sources/{data_source_id}/query",
+            payload,
+        )
+
+        results.extend(response.get("results", []))
+
+        if not response.get("has_more"):
+            break
+
+        start_cursor = response.get("next_cursor")
+        if not start_cursor:
+            break
+
+    return results
+
+
+def get_data_source(data_source_id: str) -> dict[str, Any]:
+    return notion_request(
+        "GET",
+        f"/data_sources/{data_source_id}",
+    )
+
+
+def create_page(
+    data_source_id: str,
+    properties: dict[str, Any],
+) -> dict[str, Any]:
+    return notion_request(
+        "POST",
+        "/pages",
+        {
+            "parent": {
+                "type": "data_source_id",
+                "data_source_id": data_source_id,
+            },
+            "properties": properties,
+        },
+    )
+
+
+def update_page(
+    page_id: str,
+    properties: dict[str, Any],
+) -> dict[str, Any]:
+    return notion_request(
+        "PATCH",
+        f"/pages/{page_id}",
+        {
+            "properties": properties,
+        },
+    )
+
+
+def archive_page(page_id: str) -> None:
+    notion_request(
+        "PATCH",
+        f"/pages/{page_id}",
+        {"archived": True},
+    )
+
+
+# ============================================================
+# READ PROPERTY VALUES
+# ============================================================
+
+def get_plain_text(prop: dict[str, Any] | None) -> str:
+    if not prop:
+        return ""
+
+    prop_type = prop.get("type")
+
+    if prop_type == "title":
+        items = prop.get("title", [])
+    elif prop_type == "rich_text":
+        items = prop.get("rich_text", [])
+    else:
+        return ""
+
+    return "".join(
+        item.get("plain_text", "")
+        for item in items
+    )
+
+
+def get_select_name(prop: dict[str, Any] | None) -> str | None:
+    if not prop:
+        return None
+
+    selected = prop.get("select")
+    if not selected:
+        return None
+
+    return selected.get("name")
+
+
+def get_status_name(prop: dict[str, Any] | None) -> str | None:
+    if not prop:
+        return None
+
+    selected = prop.get("status")
+    if not selected:
+        return None
+
+    return selected.get("name")
+
+
+def get_option_name(prop: dict[str, Any] | None) -> str | None:
+    if not prop:
+        return None
+
+    prop_type = prop.get("type")
+
+    if prop_type == "select":
+        return get_select_name(prop)
+
+    if prop_type == "status":
+        return get_status_name(prop)
+
+    return None
+
+
+def get_date_start(prop: dict[str, Any] | None) -> str | None:
+    if not prop:
+        return None
+
+    value = prop.get("date")
+    if not value:
+        return None
+
+    return value.get("start")
+
+
+def get_number(prop: dict[str, Any] | None):
+    if not prop:
+        return None
+    return prop.get("number")
+
+
+def get_checkbox(prop: dict[str, Any] | None) -> bool:
+    if not prop:
+        return False
+    return bool(prop.get("checkbox", False))
+
+
+# ============================================================
+# SCHEMA HELPERS FOR SHARED TABLES
+# ============================================================
+
+def normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def find_title_property_name(schema: dict[str, Any]) -> str:
+    for name, prop in schema.get("properties", {}).items():
+        if prop.get("type") == "title":
+            return name
+
+    raise RuntimeError("No title property found in Notion data source.")
+
+
+def find_property_name(
+    schema: dict[str, Any],
+    candidates: list[str],
+    allowed_types: set[str] | None = None,
+) -> str | None:
+    props = schema.get("properties", {})
+
+    # Exact first.
+    for candidate in candidates:
+        prop = props.get(candidate)
+        if prop and (
+            allowed_types is None
+            or prop.get("type") in allowed_types
+        ):
+            return candidate
+
+    # Normalized fallback.
+    by_normalized = {
+        normalize_name(name): name
+        for name in props
+    }
+
+    for candidate in candidates:
+        name = by_normalized.get(normalize_name(candidate))
+        if not name:
+            continue
+
+        prop = props[name]
+        if (
+            allowed_types is None
+            or prop.get("type") in allowed_types
+        ):
+            return name
+
+    return None
+
+
+def add_if_exists(
+    result: dict[str, Any],
+    schema: dict[str, Any],
+    candidates: list[str],
+    value: Any,
+    allowed_types: set[str],
+) -> str | None:
+    name = find_property_name(
+        schema,
+        candidates,
+        allowed_types,
+    )
+
+    if not name:
+        return None
+
+    prop_type = schema["properties"][name]["type"]
+    result[name] = build_property_for_type(prop_type, value)
+    return name
+
+
+def ensure_percent_number_property(
+    data_source_id: str,
+    property_name: str,
+) -> None:
+    schema = get_data_source(data_source_id)
+    existing = schema.get("properties", {}).get(property_name)
+
+    if existing:
+        if existing.get("type") != "number":
+            raise RuntimeError(
+                f"Shared table property '{property_name}' exists "
+                f"but is type '{existing.get('type')}', not number."
+            )
+        return
+
+    print(
+        f"➕ Shared Annual Performance is missing "
+        f"'{property_name}' column; creating it as Percent."
+    )
+
+    notion_request(
+        "PATCH",
+        f"/data_sources/{data_source_id}",
+        {
+            "properties": {
+                property_name: {
+                    "number": {
+                        "format": "percent"
+                    }
+                }
+            }
+        },
+    )
+
+    verify = get_data_source(data_source_id)
+    prop = verify.get("properties", {}).get(property_name)
+
+    if not prop or prop.get("type") != "number":
+        raise RuntimeError(
+            f"Failed to create shared annual column '{property_name}'."
+        )
+
+    print(f"✅ Created shared annual column: {property_name}")
+
+
+# ============================================================
+# COMPARISON
+# ============================================================
+
+def normalize_scalar(value: Any) -> Any:
+    if isinstance(value, float):
+        return round(value, 12)
+    return value
+
+
+def values_equal(a: Any, b: Any) -> bool:
+    a = normalize_scalar(a)
+    b = normalize_scalar(b)
+
+    if isinstance(a, float) and isinstance(b, float):
+        return abs(a - b) <= 1e-10
+
+    return a == b
+
+
+def record_equal(
+    desired: dict[str, Any],
+    actual: dict[str, Any],
+    ignore_fields: set[str] | None = None,
+) -> bool:
+    ignore_fields = ignore_fields or set()
+
+    for key, desired_value in desired.items():
+        if key in ignore_fields:
+            continue
+
+        actual_value = actual.get(key)
+
+        if key == "Year" and actual_value is not None:
+            actual_value = int(actual_value)
+
+        if not values_equal(desired_value, actual_value):
+            return False
+
+    return True
+
+
+# ============================================================
+# STRATEGY 3 PRIVATE TABLE PROPERTY MAPS
 # ============================================================
 
 def current_status_properties(record: dict[str, Any]) -> dict[str, Any]:
@@ -264,123 +621,13 @@ def history_properties(record: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ============================================================
-# QUERY HELPERS
-# ============================================================
-
-def query_all_pages(data_source_id: str) -> list[dict[str, Any]]:
-    """
-    Query every live row from a Notion data source.
-    """
-    results: list[dict[str, Any]] = []
-    start_cursor = None
-
-    while True:
-        payload: dict[str, Any] = {
-            "page_size": 100,
-        }
-
-        if start_cursor:
-            payload["start_cursor"] = start_cursor
-
-        response = notion_request(
-            "POST",
-            f"/data_sources/{data_source_id}/query",
-            payload,
-        )
-
-        results.extend(response.get("results", []))
-
-        if not response.get("has_more"):
-            break
-
-        start_cursor = response.get("next_cursor")
-        if not start_cursor:
-            break
-
-    return results
-
-
-def get_plain_text(prop: dict[str, Any] | None) -> str:
-    if not prop:
-        return ""
-
-    prop_type = prop.get("type")
-
-    if prop_type == "title":
-        items = prop.get("title", [])
-    elif prop_type == "rich_text":
-        items = prop.get("rich_text", [])
-    else:
-        return ""
-
-    return "".join(
-        item.get("plain_text", "")
-        for item in items
-    )
-
-
-def get_select_name(prop: dict[str, Any] | None) -> str | None:
-    if not prop:
-        return None
-
-    selected = prop.get("select")
-    if not selected:
-        return None
-
-    return selected.get("name")
-
-
-def get_date_start(prop: dict[str, Any] | None) -> str | None:
-    if not prop:
-        return None
-
-    value = prop.get("date")
-    if not value:
-        return None
-
-    return value.get("start")
-
-
-def get_number(prop: dict[str, Any] | None):
-    if not prop:
-        return None
-    return prop.get("number")
-
-
-def get_checkbox(prop: dict[str, Any] | None) -> bool:
-    if not prop:
-        return False
-    return bool(prop.get("checkbox", False))
-
-
-# ============================================================
-# NORMALIZATION / COMPARISON
-# ============================================================
-
-def normalize_scalar(value: Any) -> Any:
-    if isinstance(value, float):
-        return round(value, 12)
-    return value
-
-
-def values_equal(a: Any, b: Any) -> bool:
-    a = normalize_scalar(a)
-    b = normalize_scalar(b)
-
-    if isinstance(a, float) and isinstance(b, float):
-        return abs(a - b) <= 1e-10
-
-    return a == b
-
-
 def page_current_status(page: dict[str, Any]) -> dict[str, Any]:
     p = page.get("properties", {})
     return {
         "Name": get_plain_text(p.get("Name")),
-        "Current Holding": get_select_name(p.get("Current Holding")),
-        "Today's Signal": get_select_name(p.get("Today's Signal")),
-        "Next Holding": get_select_name(p.get("Next Holding")),
+        "Current Holding": get_option_name(p.get("Current Holding")),
+        "Today's Signal": get_option_name(p.get("Today's Signal")),
+        "Next Holding": get_option_name(p.get("Next Holding")),
         "Signal Date": get_date_start(p.get("Signal Date")),
         "Execute Date": get_date_start(p.get("Execute Date")),
         "QQQ Close": get_number(p.get("QQQ Close")),
@@ -428,81 +675,14 @@ def page_history(page: dict[str, Any]) -> dict[str, Any]:
         "Change": get_plain_text(p.get("Change")),
         "Signal Date": get_date_start(p.get("Signal Date")),
         "Execute Date": get_date_start(p.get("Execute Date")),
-        "From": get_select_name(p.get("From")),
-        "To": get_select_name(p.get("To")),
+        "From": get_option_name(p.get("From")),
+        "To": get_option_name(p.get("To")),
         "Reason": get_plain_text(p.get("Reason")),
     }
 
 
-def record_equal(
-    desired: dict[str, Any],
-    actual: dict[str, Any],
-    ignore_fields: set[str] | None = None,
-) -> bool:
-    ignore_fields = ignore_fields or set()
-
-    for key, desired_value in desired.items():
-        if key in ignore_fields:
-            continue
-
-        actual_value = actual.get(key)
-
-        # Year may come back from Notion as float.
-        if key == "Year" and actual_value is not None:
-            actual_value = int(actual_value)
-
-        if not values_equal(desired_value, actual_value):
-            return False
-
-    return True
-
-
 # ============================================================
-# CREATE / UPDATE / ARCHIVE
-# ============================================================
-
-def create_page(
-    data_source_id: str,
-    properties: dict[str, Any],
-) -> dict[str, Any]:
-    return notion_request(
-        "POST",
-        "/pages",
-        {
-            "parent": {
-                "type": "data_source_id",
-                "data_source_id": data_source_id,
-            },
-            "properties": properties,
-        },
-    )
-
-
-def update_page(
-    page_id: str,
-    properties: dict[str, Any],
-) -> dict[str, Any]:
-    return notion_request(
-        "PATCH",
-        f"/pages/{page_id}",
-        {
-            "properties": properties,
-        },
-    )
-
-
-def archive_page(page_id: str) -> None:
-    notion_request(
-        "PATCH",
-        f"/pages/{page_id}",
-        {
-            "archived": True,
-        },
-    )
-
-
-# ============================================================
-# GENERIC UPSERT
+# GENERIC PRIVATE-TABLE UPSERT
 # ============================================================
 
 def sync_collection(
@@ -514,7 +694,6 @@ def sync_collection(
     page_record_fn,
     property_fn,
     archive_stale: bool,
-    ignore_compare_fields: set[str] | None = None,
 ) -> dict[str, int]:
     print()
     print("=" * 70)
@@ -559,11 +738,7 @@ def sync_collection(
 
         actual = page_record_fn(existing)
 
-        if record_equal(
-            record,
-            actual,
-            ignore_fields=ignore_compare_fields,
-        ):
+        if record_equal(record, actual):
             unchanged += 1
             print(f"⏭️ {key}: unchanged")
             continue
@@ -582,7 +757,6 @@ def sync_collection(
                 archived += 1
                 print(f"🗑️ {key}: archived")
 
-        # Duplicate live rows are also stale by definition.
         for page in duplicate_pages:
             archive_page(page["id"])
             archived += 1
@@ -605,7 +779,7 @@ def sync_collection(
 
 
 # ============================================================
-# CURRENT STATUS
+# STRATEGY 3 PRIVATE CURRENT STATUS
 # ============================================================
 
 def sync_current_status(
@@ -626,7 +800,6 @@ def sync_current_status(
     print(f"N               : {record['N']:.6f}")
     print(f"V               : {record['V']:.6f}")
     print(f"SPY 40W MA      : {record['SPY 40W MA']:.4f}")
-    print(f"Data Source     : {record['Data Source']}")
 
     pages = query_all_pages(data_source_id)
 
@@ -648,8 +821,6 @@ def sync_current_status(
     canonical = matching[0]
     actual = page_current_status(canonical)
 
-    # Last Updated intentionally changes every run. Ignore it when deciding
-    # whether market/status content changed, but still write it if we update.
     if record_equal(
         record,
         actual,
@@ -665,7 +836,6 @@ def sync_current_status(
         print()
         print("✅ Strategy 3 Current Status updated in Notion")
 
-    # Clean duplicates only in full rebuild.
     if FULL_REBUILD and len(matching) > 1:
         for duplicate in matching[1:]:
             archive_page(duplicate["id"])
@@ -676,62 +846,10 @@ def sync_current_status(
 
 
 # ============================================================
-# MONTHLY / ANNUAL / HISTORY
+# STRATEGY 3 PRIVATE MONTHLY / ANNUAL / HISTORY
 # ============================================================
 
-def sync_monthly(
-    data_source_id: str,
-    records: list[dict[str, Any]],
-) -> None:
-    print()
-    print("Sync mode       :", "FULL REBUILD" if FULL_REBUILD else "SAFE UPSERT")
-
-    if FULL_REBUILD:
-        print("Checking complete monthly history.")
-
-    sync_collection(
-        label="NOTION MONTHLY PERFORMANCE",
-        data_source_id=data_source_id,
-        desired_records=records,
-        key_fn=lambda r: r["Month"],
-        page_record_fn=page_monthly,
-        property_fn=monthly_properties,
-        archive_stale=FULL_REBUILD,
-    )
-
-    if FULL_REBUILD:
-        print()
-        print("✅ Complete Strategy 3 Monthly Performance rebuilt in Notion")
-    else:
-        print()
-        print("✅ Strategy 3 Monthly Performance synced to Notion")
-
-
-def sync_annual(
-    data_source_id: str,
-    records: list[dict[str, Any]],
-) -> None:
-    sync_collection(
-        label="NOTION ANNUAL PERFORMANCE",
-        data_source_id=data_source_id,
-        desired_records=records,
-        key_fn=lambda r: r["Period"],
-        page_record_fn=page_annual,
-        property_fn=annual_properties,
-        archive_stale=FULL_REBUILD,
-    )
-
-    print()
-    print("✅ Strategy 3 Annual Performance synced to Notion")
-
-
 def history_key(record: dict[str, Any]) -> tuple[str, str, str, str]:
-    """
-    Stable identity for one historical position transition.
-
-    Change alone is not unique, so use:
-      Signal Date + Execute Date + From + To
-    """
     return (
         record["Signal Date"],
         record["Execute Date"],
@@ -754,13 +872,11 @@ def sync_position_history(
     print("NOTION POSITION HISTORY")
     print("=" * 70)
 
-    if FULL_REBUILD:
-        print("Full rebuild mode enabled.")
-        print("Checking complete Position History.")
-        print("Old rows not present in the new backtest will be archived.")
-    else:
-        print("Safe upsert mode.")
-        print("Stale historical rows will NOT be archived.")
+    print(
+        "Full rebuild mode enabled."
+        if FULL_REBUILD
+        else "Safe upsert mode."
+    )
 
     existing_pages = query_all_pages(data_source_id)
 
@@ -840,6 +956,320 @@ def sync_position_history(
 
 
 # ============================================================
+# SHARED TABLE: MAIN CURRENT POSITIONS
+# ============================================================
+
+def sync_main_current_positions(record: dict[str, Any]) -> None:
+    print()
+    print("=" * 70)
+    print("NOTION MAIN CURRENT POSITIONS")
+    print("=" * 70)
+
+    schema = get_data_source(MAIN_CURRENT_POSITIONS_DS)
+    title_name = find_title_property_name(schema)
+
+    desired: dict[str, Any] = {}
+    desired[title_name] = prop_title("Strategy 3")
+
+    add_if_exists(
+        desired, schema,
+        ["Current Holding"],
+        record["Current Holding"],
+        {"select", "status"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Today's Signal", "Today Signal"],
+        record["Today's Signal"],
+        {"select", "status"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Next Holding"],
+        record["Next Holding"],
+        {"select", "status"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Signal Date"],
+        record["Signal Date"],
+        {"date"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Execute Date"],
+        record["Execute Date"],
+        {"date"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Pending Change"],
+        record["Current Holding"] != record["Next Holding"],
+        {"checkbox"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Reason"],
+        record["Reason"],
+        {"rich_text"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Last Updated"],
+        record["Last Updated"],
+        {"date"},
+    )
+    add_if_exists(
+        desired, schema,
+        ["Data Source", "Data Sources"],
+        record["Data Source"],
+        {"rich_text"},
+    )
+
+    pages = query_all_pages(MAIN_CURRENT_POSITIONS_DS)
+    matching = [
+        page for page in pages
+        if get_plain_text(
+            page.get("properties", {}).get(title_name)
+        ) == "Strategy 3"
+    ]
+
+    if not matching:
+        create_page(
+            MAIN_CURRENT_POSITIONS_DS,
+            desired,
+        )
+        print("➕ Main Current Positions Strategy 3 created in Notion")
+    else:
+        update_page(
+            matching[0]["id"],
+            desired,
+        )
+        print("✅ Main Current Positions Strategy 3 updated in Notion")
+
+    print(f"Current Holding : {record['Current Holding']}")
+    print(f"Today's Signal  : {record['Today\'s Signal']}")
+    print(f"Next Holding    : {record['Next Holding']}")
+    print(f"Signal Date     : {record['Signal Date']}")
+    print(f"Execute Date    : {record['Execute Date']}")
+
+
+# ============================================================
+# SHARED TABLE: STRATEGY OVERVIEW
+# ============================================================
+
+def load_summary_metrics() -> dict[str, float]:
+    if not SUMMARY_FILE.exists():
+        raise FileNotFoundError(
+            f"Missing {SUMMARY_FILE}. Run strategy3.py first."
+        )
+
+    with SUMMARY_FILE.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data["summary"]["Strategy 3"]
+
+
+def sync_main_strategy_overview(
+    metrics: dict[str, float],
+    last_updated: str,
+) -> None:
+    print()
+    print("=" * 70)
+    print("NOTION STRATEGY OVERVIEW")
+    print("=" * 70)
+
+    schema = get_data_source(MAIN_STRATEGY_OVERVIEW_DS)
+    title_name = find_title_property_name(schema)
+
+    desired: dict[str, Any] = {
+        title_name: prop_title("Strategy 3")
+    }
+
+    mapped = {}
+
+    mapped["YTD Return"] = add_if_exists(
+        desired, schema,
+        ["YTD Return", "YTD"],
+        metrics["YTD Return"],
+        {"number"},
+    )
+
+    mapped["Since 2016"] = add_if_exists(
+        desired, schema,
+        ["Since 2016", "Since 2016 Return", "Total Return"],
+        metrics["Since 2016"],
+        {"number"},
+    )
+
+    mapped["CAGR"] = add_if_exists(
+        desired, schema,
+        ["CAGR"],
+        metrics["CAGR"],
+        {"number"},
+    )
+
+    mapped["Max Drawdown"] = add_if_exists(
+        desired, schema,
+        ["Max Drawdown", "MDD"],
+        metrics["Max Drawdown"],
+        {"number"},
+    )
+
+    add_if_exists(
+        desired, schema,
+        ["Last Updated"],
+        last_updated,
+        {"date"},
+    )
+
+    missing_metrics = [
+        name for name, mapped_name in mapped.items()
+        if mapped_name is None
+    ]
+
+    if missing_metrics:
+        raise RuntimeError(
+            "Strategy Overview is missing expected numeric columns: "
+            + ", ".join(missing_metrics)
+        )
+
+    pages = query_all_pages(MAIN_STRATEGY_OVERVIEW_DS)
+    matching = [
+        page for page in pages
+        if get_plain_text(
+            page.get("properties", {}).get(title_name)
+        ) == "Strategy 3"
+    ]
+
+    if not matching:
+        create_page(
+            MAIN_STRATEGY_OVERVIEW_DS,
+            desired,
+        )
+        print("➕ Strategy 3 Overview row created")
+    else:
+        update_page(
+            matching[0]["id"],
+            desired,
+        )
+        print("✏️ Strategy 3 Overview row updated")
+
+    print(f"YTD Return    : {metrics['YTD Return'] * 100:.2f}%")
+    print(f"Since 2016    : {metrics['Since 2016'] * 100:.2f}%")
+    print(f"CAGR          : {metrics['CAGR'] * 100:.2f}%")
+    print(f"Max Drawdown  : {metrics['Max Drawdown'] * 100:.2f}%")
+    print()
+    print("✅ Strategy 3 Overview synced to Notion")
+
+
+# ============================================================
+# SHARED TABLE: MAIN ANNUAL PERFORMANCE
+# ============================================================
+
+def sync_main_annual_performance(
+    annual_records: list[dict[str, Any]],
+) -> None:
+    print()
+    print("=" * 70)
+    print("NOTION MAIN ANNUAL PERFORMANCE")
+    print("=" * 70)
+
+    # This shared table may not yet have a Strategy 3 column.
+    # If missing, create exactly one Percent column named Strategy 3.
+    ensure_percent_number_property(
+        MAIN_ANNUAL_PERFORMANCE_DS,
+        "Strategy 3",
+    )
+
+    schema = get_data_source(MAIN_ANNUAL_PERFORMANCE_DS)
+    title_name = find_title_property_name(schema)
+
+    strategy3_prop = find_property_name(
+        schema,
+        ["Strategy 3"],
+        {"number"},
+    )
+
+    if not strategy3_prop:
+        raise RuntimeError(
+            "Could not resolve Strategy 3 column in main Annual Performance."
+        )
+
+    year_prop = find_property_name(
+        schema,
+        ["Year"],
+        {"number"},
+    )
+
+    pages = query_all_pages(MAIN_ANNUAL_PERFORMANCE_DS)
+
+    existing_by_period = {
+        get_plain_text(
+            page.get("properties", {}).get(title_name)
+        ): page
+        for page in pages
+    }
+
+    created = 0
+    updated = 0
+    unchanged = 0
+
+    print("Checking complete Strategy 3 annual column.")
+    print()
+
+    for record in annual_records:
+        period = record["Period"]
+        desired_value = float(record["Strategy 3"])
+        existing = existing_by_period.get(period)
+
+        if existing is None:
+            props = {
+                title_name: prop_title(period),
+                strategy3_prop: prop_number(desired_value),
+            }
+
+            if year_prop:
+                props[year_prop] = prop_number(record["Year"])
+
+            create_page(
+                MAIN_ANNUAL_PERFORMANCE_DS,
+                props,
+            )
+
+            created += 1
+            print(f"➕ {period}: Strategy 3 created")
+            continue
+
+        actual_value = get_number(
+            existing.get("properties", {}).get(strategy3_prop)
+        )
+
+        if values_equal(desired_value, actual_value):
+            unchanged += 1
+            print(f"⏭️ {period}: unchanged")
+            continue
+
+        update_page(
+            existing["id"],
+            {
+                strategy3_prop: prop_number(desired_value)
+            },
+        )
+
+        updated += 1
+        print(f"✏️ {period}: Strategy 3 updated")
+
+    print()
+    print(f"Years checked : {len(annual_records)}")
+    print(f"Updated       : {updated}")
+    print(f"Created       : {created}")
+    print(f"Unchanged     : {unchanged}")
+    print()
+    print("✅ Main Annual Performance Strategy 3 column synced to Notion")
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -852,31 +1282,69 @@ def main() -> None:
 
     payload = build_notion_payload()
 
-    ids = payload["data_source_ids"]
+    # ========================================================
+    # Strategy 3 private tables
+    # ========================================================
 
     sync_current_status(
-        ids["current_status"],
+        STRATEGY3_CURRENT_STATUS_DS,
         payload["current_status"],
     )
 
-    sync_monthly(
-        ids["monthly_performance"],
-        payload["monthly_performance"],
+    sync_collection(
+        label="NOTION MONTHLY PERFORMANCE",
+        data_source_id=STRATEGY3_MONTHLY_DS,
+        desired_records=payload["monthly_performance"],
+        key_fn=lambda r: r["Month"],
+        page_record_fn=page_monthly,
+        property_fn=monthly_properties,
+        archive_stale=FULL_REBUILD,
     )
 
-    sync_annual(
-        ids["annual_performance"],
-        payload["annual_performance"],
+    print()
+    print("✅ Strategy 3 Monthly Performance synced to Notion")
+
+    sync_collection(
+        label="NOTION ANNUAL PERFORMANCE",
+        data_source_id=STRATEGY3_ANNUAL_DS,
+        desired_records=payload["annual_performance"],
+        key_fn=lambda r: r["Period"],
+        page_record_fn=page_annual,
+        property_fn=annual_properties,
+        archive_stale=FULL_REBUILD,
     )
+
+    print()
+    print("✅ Strategy 3 Annual Performance synced to Notion")
 
     sync_position_history(
-        ids["position_history"],
+        STRATEGY3_HISTORY_DS,
         payload["position_history"],
+    )
+
+    # ========================================================
+    # Shared/main tables
+    # ========================================================
+
+    sync_main_current_positions(
+        payload["current_status"],
+    )
+
+    metrics = load_summary_metrics()
+
+    sync_main_strategy_overview(
+        metrics,
+        payload["current_status"]["Last Updated"],
+    )
+
+    sync_main_annual_performance(
+        payload["annual_performance"],
     )
 
     print()
     print("=" * 70)
     print("✅ Strategy 3 Notion sync completed")
+    print("✅ Strategy 3 is now included in the shared/main tables")
     print("=" * 70)
 
 
