@@ -31,6 +31,11 @@ STRATEGY1_HISTORY_DATA_SOURCE_ID = os.environ[
     "STRATEGY1_HISTORY_DATA_SOURCE_ID"
 ]
 
+CURRENT_POSITIONS_DATA_SOURCE_ID = os.environ[
+    "CURRENT_POSITIONS_DATA_SOURCE_ID"
+]
+
+
 NOTION_VERSION = "2025-09-03"
 
 SUMMARY_FILE = "output/strategy1_summary.json"
@@ -42,17 +47,23 @@ NYSE = mcal.get_calendar("NYSE")
 
 WRITE_DELAY_SECONDS = 0.35
 
-# 最近多少个自然日的换仓记录允许被重新核对/修复
+# Re-check recent position changes in case Yahoo later repairs data.
 HISTORY_REPAIR_DAYS = 45
 
 
 # ============================================================
 # PERFORMANCE PRECISION
 #
+# Notion percent stores decimals:
+#
 # 0.022210 = 2.2210%
+#
+# Six stored decimal places therefore gives
+# four decimal places in the percentage display.
 # ============================================================
 
 PERFORMANCE_STORAGE_DECIMALS = 6
+
 NUMBER_TOLERANCE = 1e-12
 
 
@@ -60,62 +71,110 @@ NUMBER_TOLERANCE = 1e-12
 # NOTION API
 # ============================================================
 
-def notion_request(method, path, body=None):
-    url = "https://api.notion.com/v1/" + path
+def notion_request(
+    method,
+    path,
+    body=None,
+):
+    url = (
+        "https://api.notion.com/v1/"
+        + path
+    )
 
     data = None
 
     if body is not None:
-        data = json.dumps(body).encode("utf-8")
+        data = json.dumps(
+            body
+        ).encode(
+            "utf-8"
+        )
 
     request = urllib.request.Request(
         url,
         data=data,
         method=method,
         headers={
-            "Authorization": f"Bearer {NOTION_TOKEN}",
-            "Notion-Version": NOTION_VERSION,
-            "Content-Type": "application/json",
+            "Authorization": (
+                f"Bearer {NOTION_TOKEN}"
+            ),
+            "Notion-Version": (
+                NOTION_VERSION
+            ),
+            "Content-Type": (
+                "application/json"
+            ),
         },
     )
 
     try:
-        with urllib.request.urlopen(request) as response:
-            text = response.read().decode("utf-8")
+        with urllib.request.urlopen(
+            request
+        ) as response:
+
+            text = (
+                response
+                .read()
+                .decode("utf-8")
+            )
 
             if not text:
                 return {}
 
-            return json.loads(text)
+            return json.loads(
+                text
+            )
 
     except urllib.error.HTTPError as e:
-        error_body = e.read().decode(
-            "utf-8",
-            errors="replace",
+
+        error_body = (
+            e.read()
+            .decode(
+                "utf-8",
+                errors="replace",
+            )
         )
 
         raise RuntimeError(
             f"Notion API failed: "
-            f"HTTP {e.code} {e.reason}\n"
+            f"HTTP {e.code} "
+            f"{e.reason}\n"
             f"{error_body}"
         ) from e
 
 
-def query_all_pages(data_source_id):
+def query_all_pages(
+    data_source_id,
+):
+    """
+    Read every row from a Notion data source.
+    """
+
     pages = []
+
     start_cursor = None
 
     while True:
+
         body = {
             "page_size": 100,
         }
 
-        if start_cursor is not None:
-            body["start_cursor"] = start_cursor
+        if (
+            start_cursor
+            is not None
+        ):
+            body[
+                "start_cursor"
+            ] = start_cursor
 
         result = notion_request(
             "POST",
-            f"data_sources/{data_source_id}/query",
+            (
+                "data_sources/"
+                f"{data_source_id}"
+                "/query"
+            ),
             body,
         )
 
@@ -146,66 +205,97 @@ def query_all_pages(data_source_id):
 # PROPERTY BUILDERS
 # ============================================================
 
-def notion_title(value):
+def notion_title(
+    value,
+):
     return {
         "title": [
             {
                 "type": "text",
                 "text": {
-                    "content": str(value)
+                    "content": str(
+                        value
+                    )
                 },
             }
         ]
     }
 
 
-def notion_text(value):
+def notion_text(
+    value,
+):
     return {
         "rich_text": [
             {
                 "type": "text",
                 "text": {
-                    "content": str(value)
+                    "content": str(
+                        value
+                    )
                 },
             }
         ]
     }
 
 
-def notion_select(value):
+def notion_select(
+    value,
+):
     return {
         "select": {
-            "name": str(value)
+            "name": str(
+                value
+            )
         }
     }
 
 
-def notion_number(value):
+def notion_number(
+    value,
+):
     return {
-        "number": float(value)
+        "number": float(
+            value
+        )
     }
 
 
-def notion_checkbox(value):
+def notion_checkbox(
+    value,
+):
     return {
-        "checkbox": bool(value)
+        "checkbox": bool(
+            value
+        )
     }
 
 
-def notion_date(value):
+def notion_date(
+    value,
+):
     return {
         "date": {
-            "start": str(value)
+            "start": str(
+                value
+            )
         }
     }
 
 
-def normalize_performance(value):
-    value = float(value)
+def normalize_performance(
+    value,
+):
+    value = float(
+        value
+    )
 
-    if not math.isfinite(value):
+    if not math.isfinite(
+        value
+    ):
         raise ValueError(
-            f"Invalid performance value: {value}"
+            f"Invalid performance value: "
+            f"{value}"
         )
 
     return round(
@@ -214,9 +304,15 @@ def normalize_performance(value):
     )
 
 
-def notion_performance_number(value):
+def notion_performance_number(
+    value,
+):
     return {
-        "number": normalize_performance(value)
+        "number": (
+            normalize_performance(
+                value
+            )
+        )
     }
 
 
@@ -224,11 +320,20 @@ def notion_performance_number(value):
 # PROPERTY READERS
 # ============================================================
 
-def get_title_value(page, property_name):
+def get_title_value(
+    page,
+    property_name,
+):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
     title = prop.get(
@@ -237,16 +342,28 @@ def get_title_value(page, property_name):
     )
 
     return "".join(
-        item.get("plain_text", "")
+        item.get(
+            "plain_text",
+            "",
+        )
         for item in title
     )
 
 
-def get_rich_text_value(page, property_name):
+def get_rich_text_value(
+    page,
+    property_name,
+):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
     items = prop.get(
@@ -255,62 +372,110 @@ def get_rich_text_value(page, property_name):
     )
 
     return "".join(
-        item.get("plain_text", "")
+        item.get(
+            "plain_text",
+            "",
+        )
         for item in items
     )
 
 
-def get_select_value(page, property_name):
+def get_select_value(
+    page,
+    property_name,
+):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
-    value = prop.get("select")
+    value = prop.get(
+        "select"
+    )
 
     if not value:
         return None
 
-    return value.get("name")
-
-
-def get_number_value(page, property_name):
-    prop = (
-        page
-        .get("properties", {})
-        .get(property_name, {})
+    return value.get(
+        "name"
     )
 
-    return prop.get("number")
 
-
-def get_date_value(page, property_name):
+def get_number_value(
+    page,
+    property_name,
+):
     prop = (
         page
-        .get("properties", {})
-        .get(property_name, {})
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
     )
 
-    date = prop.get("date")
+    return prop.get(
+        "number"
+    )
+
+
+def get_date_value(
+    page,
+    property_name,
+):
+    prop = (
+        page
+        .get(
+            "properties",
+            {},
+        )
+        .get(
+            property_name,
+            {},
+        )
+    )
+
+    date = prop.get(
+        "date"
+    )
 
     if not date:
         return None
 
-    return date.get("start")
+    return date.get(
+        "start"
+    )
 
 
 # ============================================================
 # COMPARISON
 # ============================================================
 
-def numbers_equal(current, expected):
+def numbers_equal(
+    current,
+    expected,
+):
     if current is None:
         return False
 
     try:
-        current = float(current)
-        expected = float(expected)
+        current = float(
+            current
+        )
+
+        expected = float(
+            expected
+        )
 
     except (
         TypeError,
@@ -319,8 +484,13 @@ def numbers_equal(current, expected):
         return False
 
     if (
-        not math.isfinite(current)
-        or not math.isfinite(expected)
+        not math.isfinite(
+            current
+        )
+        or
+        not math.isfinite(
+            expected
+        )
     ):
         return False
 
@@ -332,17 +502,26 @@ def numbers_equal(current, expected):
     )
 
 
-def dates_equal(current, expected):
+def dates_equal(
+    current,
+    expected,
+):
     if current is None:
         return False
 
     try:
         return (
-            pd.Timestamp(current).strftime(
+            pd.Timestamp(
+                current
+            )
+            .strftime(
                 "%Y-%m-%d"
             )
             ==
-            pd.Timestamp(expected).strftime(
+            pd.Timestamp(
+                expected
+            )
+            .strftime(
                 "%Y-%m-%d"
             )
         )
@@ -361,46 +540,69 @@ def load_strategy_output():
         "r",
         encoding="utf-8",
     ) as f:
-        payload = json.load(f)
 
-    if "current_status" not in payload:
-        raise RuntimeError(
-            "strategy1_summary.json "
-            "does not contain current_status."
+        payload = json.load(
+            f
         )
 
-    return payload["current_status"]
+    if (
+        "current_status"
+        not in payload
+    ):
+        raise RuntimeError(
+            "strategy1_summary.json "
+            "does not contain "
+            "current_status."
+        )
+
+    return payload[
+        "current_status"
+    ]
 
 
 # ============================================================
 # NEXT TRADING DAY
 # ============================================================
 
-def get_next_trading_day(signal_date):
+def get_next_trading_day(
+    signal_date,
+):
     signal_date = (
-        pd.Timestamp(signal_date)
+        pd.Timestamp(
+            signal_date
+        )
         .normalize()
     )
 
     schedule = NYSE.schedule(
         start_date=(
             signal_date
-            + pd.Timedelta(days=1)
+            + pd.Timedelta(
+                days=1
+            )
         ).date(),
+
         end_date=(
             signal_date
-            + pd.Timedelta(days=14)
+            + pd.Timedelta(
+                days=14
+            )
         ).date(),
     )
 
     if schedule.empty:
         raise RuntimeError(
-            "Could not determine next trading day."
+            "Could not determine "
+            "next trading day."
         )
 
     return (
-        pd.Timestamp(schedule.index[0])
-        .strftime("%Y-%m-%d")
+        pd.Timestamp(
+            schedule.index[0]
+        )
+        .strftime(
+            "%Y-%m-%d"
+        )
     )
 
 
@@ -408,7 +610,9 @@ def get_next_trading_day(signal_date):
 # DATA SOURCE DISPLAY
 # ============================================================
 
-def short_source_name(source):
+def short_source_name(
+    source,
+):
     mapping = {
         "daily": "daily",
         "5m_fallback": "5m",
@@ -421,7 +625,9 @@ def short_source_name(source):
     )
 
 
-def build_data_source_text(data_sources):
+def build_data_source_text(
+    data_sources,
+):
     order = [
         "NDX",
         "SPX",
@@ -433,27 +639,43 @@ def build_data_source_text(data_sources):
     grouped = {}
 
     for ticker in order:
-        source = short_source_name(
-            data_sources[ticker]
+
+        source = (
+            short_source_name(
+                data_sources[
+                    ticker
+                ]
+            )
         )
 
         grouped.setdefault(
             source,
             [],
-        ).append(ticker)
-
-    parts = ["Yahoo"]
-
-    for source, tickers in grouped.items():
-        parts.append(
-            f"{'/'.join(tickers)}: {source}"
+        ).append(
+            ticker
         )
 
-    return " | ".join(parts)
+    parts = [
+        "Yahoo"
+    ]
+
+    for (
+        source,
+        tickers,
+    ) in grouped.items():
+
+        parts.append(
+            f"{'/'.join(tickers)}: "
+            f"{source}"
+        )
+
+    return " | ".join(
+        parts
+    )
 
 
 # ============================================================
-# CURRENT STATUS
+# STRATEGY 1 DETAIL — CURRENT STATUS
 # ============================================================
 
 def find_current_status_page():
@@ -468,7 +690,9 @@ def find_current_status_page():
             "filter": {
                 "property": "Name",
                 "title": {
-                    "equals": "Strategy 1"
+                    "equals": (
+                        "Strategy 1"
+                    )
                 },
             },
             "page_size": 10,
@@ -482,94 +706,161 @@ def find_current_status_page():
 
     if len(pages) == 0:
         raise RuntimeError(
-            "Could not find Strategy 1 "
-            "row in Current Status."
+            "Could not find "
+            "Strategy 1 row in "
+            "Current Status."
         )
 
     if len(pages) > 1:
         raise RuntimeError(
-            "More than one Strategy 1 "
-            "row found in Current Status."
+            "More than one "
+            "Strategy 1 row found "
+            "in Current Status."
         )
 
-    return pages[0]["id"]
+    return pages[0][
+        "id"
+    ]
 
 
 def sync_current_status():
-    status = load_strategy_output()
-
-    signal_date = status["Signal Date"]
-
-    execute_date = get_next_trading_day(
-        signal_date
+    status = (
+        load_strategy_output()
     )
 
-    data_source_text = build_data_source_text(
-        status["Data Sources"]
+    signal_date = status[
+        "Signal Date"
+    ]
+
+    execute_date = (
+        get_next_trading_day(
+            signal_date
+        )
     )
 
-    page_id = find_current_status_page()
+    data_source_text = (
+        build_data_source_text(
+            status[
+                "Data Sources"
+            ]
+        )
+    )
+
+    page_id = (
+        find_current_status_page()
+    )
 
     last_updated = (
-        pd.Timestamp.now(tz="UTC")
+        pd.Timestamp.now(
+            tz="UTC"
+        )
         .isoformat()
     )
 
     properties = {
-        "Current Holding": notion_select(
-            status["Current Holding"]
+
+        "Current Holding": (
+            notion_select(
+                status[
+                    "Current Holding"
+                ]
+            )
         ),
 
-        "Today's Signal": notion_select(
-            status["Today's Signal"]
+        "Today's Signal": (
+            notion_select(
+                status[
+                    "Today's Signal"
+                ]
+            )
         ),
 
-        "Next Holding": notion_select(
-            status["Next Holding"]
+        "Next Holding": (
+            notion_select(
+                status[
+                    "Next Holding"
+                ]
+            )
         ),
 
-        "Signal Date": notion_date(
-            signal_date
+        "Signal Date": (
+            notion_date(
+                signal_date
+            )
         ),
 
-        "Execute Date": notion_date(
-            execute_date
+        "Execute Date": (
+            notion_date(
+                execute_date
+            )
         ),
 
-        "NDX Close": notion_number(
-            status["NDX Close"]
+        "NDX Close": (
+            notion_number(
+                status[
+                    "NDX Close"
+                ]
+            )
         ),
 
-        "NDX MA30": notion_number(
-            status["NDX MA30"]
+        "NDX MA30": (
+            notion_number(
+                status[
+                    "NDX MA30"
+                ]
+            )
         ),
 
-        "NDX > MA30": notion_checkbox(
-            status["NDX > MA30"]
+        "NDX > MA30": (
+            notion_checkbox(
+                status[
+                    "NDX > MA30"
+                ]
+            )
         ),
 
-        "SPX MA50": notion_number(
-            status["SPX MA50"]
+        "SPX MA50": (
+            notion_number(
+                status[
+                    "SPX MA50"
+                ]
+            )
         ),
 
-        "SPX MA200": notion_number(
-            status["SPX MA200"]
+        "SPX MA200": (
+            notion_number(
+                status[
+                    "SPX MA200"
+                ]
+            )
         ),
 
-        "SPX MA50 > MA200": notion_checkbox(
-            status["SPX MA50 > MA200"]
+        "SPX MA50 > MA200": (
+            notion_checkbox(
+                status[
+                    "SPX MA50 > MA200"
+                ]
+            )
         ),
 
-        "Reason": notion_text(
-            status["Reason"]
+        "Reason": (
+            notion_text(
+                status[
+                    "Reason"
+                ]
+            )
         ),
 
-        "Last Updated": notion_date(
-            last_updated
+        "Last Updated": (
+            notion_date(
+                last_updated
+            )
         ),
 
-        "Data Source": notion_text(
-            data_source_text
+        "Data Source": (
+            notion_text(
+                data_source_text
+            )
         ),
     }
 
@@ -577,39 +868,258 @@ def sync_current_status():
         "PATCH",
         f"pages/{page_id}",
         {
-            "properties": properties
+            "properties": (
+                properties
+            )
         },
     )
 
     print()
     print("=" * 70)
-    print("NOTION CURRENT STATUS")
+    print(
+        "NOTION CURRENT STATUS"
+    )
     print("=" * 70)
 
-    print("Name            : Strategy 1")
-    print("Signal Date     :", signal_date)
-    print("Execute Date    :", execute_date)
+    print(
+        "Name            : "
+        "Strategy 1"
+    )
+
+    print(
+        "Signal Date     :",
+        signal_date,
+    )
+
+    print(
+        "Execute Date    :",
+        execute_date,
+    )
+
     print(
         "Current Holding :",
-        status["Current Holding"],
+        status[
+            "Current Holding"
+        ],
     )
+
     print(
         "Today's Signal  :",
-        status["Today's Signal"],
+        status[
+            "Today's Signal"
+        ],
     )
+
     print(
         "Next Holding    :",
-        status["Next Holding"],
+        status[
+            "Next Holding"
+        ],
     )
+
     print(
         "Data Source     :",
         data_source_text,
     )
 
     print()
+
     print(
         "✅ Strategy 1 Current Status "
         "updated in Notion"
+    )
+
+
+# ============================================================
+# MAIN PAGE — CURRENT POSITIONS
+# ============================================================
+
+def find_main_current_position_page():
+    """
+    Find Strategy 1 row in the main
+    Current Positions database.
+
+    Strategy 2 and Strategy 3 are untouched.
+    """
+
+    result = notion_request(
+        "POST",
+        (
+            "data_sources/"
+            f"{CURRENT_POSITIONS_DATA_SOURCE_ID}"
+            "/query"
+        ),
+        {
+            "filter": {
+                "property": "Name",
+                "title": {
+                    "equals": (
+                        "Strategy 1"
+                    )
+                },
+            },
+            "page_size": 10,
+        },
+    )
+
+    pages = result.get(
+        "results",
+        [],
+    )
+
+    if len(pages) == 0:
+        raise RuntimeError(
+            "Could not find "
+            "Strategy 1 row in "
+            "main Current Positions."
+        )
+
+    if len(pages) > 1:
+        raise RuntimeError(
+            "More than one "
+            "Strategy 1 row found "
+            "in main Current Positions."
+        )
+
+    return pages[0][
+        "id"
+    ]
+
+
+def sync_main_current_positions():
+    """
+    Update only Strategy 1 on the
+    main Quant Strategy page.
+    """
+
+    status = (
+        load_strategy_output()
+    )
+
+    signal_date = status[
+        "Signal Date"
+    ]
+
+    execute_date = (
+        get_next_trading_day(
+            signal_date
+        )
+    )
+
+    page_id = (
+        find_main_current_position_page()
+    )
+
+    last_updated = (
+        pd.Timestamp.now(
+            tz="UTC"
+        )
+        .isoformat()
+    )
+
+    properties = {
+
+        "Current Holding": (
+            notion_select(
+                status[
+                    "Current Holding"
+                ]
+            )
+        ),
+
+        "Today's Signal": (
+            notion_select(
+                status[
+                    "Today's Signal"
+                ]
+            )
+        ),
+
+        "Next Holding": (
+            notion_select(
+                status[
+                    "Next Holding"
+                ]
+            )
+        ),
+
+        "Signal Date": (
+            notion_date(
+                signal_date
+            )
+        ),
+
+        "Execute Date": (
+            notion_date(
+                execute_date
+            )
+        ),
+
+        "Last Updated": (
+            notion_date(
+                last_updated
+            )
+        ),
+    }
+
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": (
+                properties
+            )
+        },
+    )
+
+    print()
+    print("=" * 70)
+    print(
+        "NOTION MAIN CURRENT POSITIONS"
+    )
+    print("=" * 70)
+
+    print(
+        "Name            : "
+        "Strategy 1"
+    )
+
+    print(
+        "Current Holding :",
+        status[
+            "Current Holding"
+        ],
+    )
+
+    print(
+        "Today's Signal  :",
+        status[
+            "Today's Signal"
+        ],
+    )
+
+    print(
+        "Next Holding    :",
+        status[
+            "Next Holding"
+        ],
+    )
+
+    print(
+        "Signal Date     :",
+        signal_date,
+    )
+
+    print(
+        "Execute Date    :",
+        execute_date,
+    )
+
+    print()
+
+    print(
+        "✅ Main Current Positions "
+        "Strategy 1 updated in Notion"
     )
 
 
@@ -634,14 +1144,18 @@ def load_monthly_results():
 
     missing = (
         required
-        - set(monthly.columns)
+        - set(
+            monthly.columns
+        )
     )
 
     if missing:
         raise RuntimeError(
             "Monthly CSV missing: "
             + ", ".join(
-                sorted(missing)
+                sorted(
+                    missing
+                )
             )
         )
 
@@ -654,11 +1168,15 @@ def load_monthly_results():
                 "SPY",
             ]
         ]
-        .sort_values("Month")
+        .sort_values(
+            "Month"
+        )
     )
 
 
-def find_month_page(month):
+def find_month_page(
+    month,
+):
     result = notion_request(
         "POST",
         (
@@ -684,7 +1202,8 @@ def find_month_page(month):
 
     if len(pages) > 1:
         raise RuntimeError(
-            f"Duplicate Month row: {month}"
+            f"Duplicate Month row: "
+            f"{month}"
         )
 
     if not pages:
@@ -705,17 +1224,26 @@ def create_month_row(
         "pages",
         {
             "parent": {
-                "type": "data_source_id",
+                "type": (
+                    "data_source_id"
+                ),
                 "data_source_id": (
                     STRATEGY1_MONTHLY_DATA_SOURCE_ID
                 ),
             },
 
             "properties": {
-                "Month": notion_title(month),
 
-                "Month Start": notion_date(
-                    month_start
+                "Month": (
+                    notion_title(
+                        month
+                    )
+                ),
+
+                "Month Start": (
+                    notion_date(
+                        month_start
+                    )
                 ),
 
                 "Strategy 1": (
@@ -752,8 +1280,11 @@ def update_month_row(
         f"pages/{page_id}",
         {
             "properties": {
-                "Month Start": notion_date(
-                    month_start
+
+                "Month Start": (
+                    notion_date(
+                        month_start
+                    )
                 ),
 
                 "Strategy 1": (
@@ -778,21 +1309,29 @@ def update_month_row(
     )
 
 
-def sync_one_month(row):
+def sync_one_month(
+    row,
+):
     month = str(
-        row["Month"]
+        row[
+            "Month"
+        ]
     )
 
     month_start = (
         pd.Timestamp(
             f"{month}-01"
         )
-        .strftime("%Y-%m-%d")
+        .strftime(
+            "%Y-%m-%d"
+        )
     )
 
     strategy_return = (
         normalize_performance(
-            row["Strategy 1"]
+            row[
+                "Strategy 1"
+            ]
         )
     )
 
@@ -808,11 +1347,14 @@ def sync_one_month(row):
         )
     )
 
-    page = find_month_page(
-        month
+    page = (
+        find_month_page(
+            month
+        )
     )
 
     if page is None:
+
         create_month_row(
             month,
             month_start,
@@ -828,6 +1370,7 @@ def sync_one_month(row):
         return "created"
 
     is_same = (
+
         dates_equal(
             get_date_value(
                 page,
@@ -835,7 +1378,9 @@ def sync_one_month(row):
             ),
             month_start,
         )
+
         and
+
         numbers_equal(
             get_number_value(
                 page,
@@ -843,7 +1388,9 @@ def sync_one_month(row):
             ),
             strategy_return,
         )
+
         and
+
         numbers_equal(
             get_number_value(
                 page,
@@ -851,7 +1398,9 @@ def sync_one_month(row):
             ),
             qqq_return,
         )
+
         and
+
         numbers_equal(
             get_number_value(
                 page,
@@ -862,6 +1411,7 @@ def sync_one_month(row):
     )
 
     if is_same:
+
         print(
             f"⏭️ {month}: unchanged"
         )
@@ -886,10 +1436,14 @@ def sync_one_month(row):
 def sync_monthly_performance():
     print()
     print("=" * 70)
-    print("NOTION MONTHLY PERFORMANCE")
+    print(
+        "NOTION MONTHLY PERFORMANCE"
+    )
     print("=" * 70)
 
-    monthly = load_monthly_results()
+    monthly = (
+        load_monthly_results()
+    )
 
     recent = (
         monthly
@@ -901,17 +1455,28 @@ def sync_monthly_performance():
     created = 0
     unchanged = 0
 
-    print("Checking months:")
+    print(
+        "Checking months:"
+    )
 
-    for month in recent["Month"]:
+    for month in recent[
+        "Month"
+    ]:
         print(
             f"  {month}"
         )
 
     print()
 
-    for _, row in recent.iterrows():
-        result = sync_one_month(row)
+    for _, row in (
+        recent.iterrows()
+    ):
+
+        result = (
+            sync_one_month(
+                row
+            )
+        )
 
         if result == "updated":
             updated += 1
@@ -927,24 +1492,31 @@ def sync_monthly_performance():
         )
 
     print()
+
     print(
         "Months checked :",
-        len(recent),
+        len(
+            recent
+        ),
     )
+
     print(
         "Updated        :",
         updated,
     )
+
     print(
         "Created        :",
         created,
     )
+
     print(
         "Unchanged      :",
         unchanged,
     )
 
     print()
+
     print(
         "✅ Recent Strategy 1 Monthly "
         "Performance synced to Notion"
@@ -969,14 +1541,18 @@ def load_annual_results():
 
     missing = (
         required
-        - set(annual.columns)
+        - set(
+            annual.columns
+        )
     )
 
     if missing:
         raise RuntimeError(
             "Annual CSV missing: "
             + ", ".join(
-                sorted(missing)
+                sorted(
+                    missing
+                )
             )
         )
 
@@ -989,9 +1565,15 @@ def load_annual_results():
         ]
     ].copy()
 
-    annual["Year"] = (
-        annual["Year"]
-        .astype(int)
+    annual[
+        "Year"
+    ] = (
+        annual[
+            "Year"
+        ]
+        .astype(
+            int
+        )
     )
 
     return annual.sort_values(
@@ -1004,35 +1586,49 @@ def annual_period_name(
     latest_year,
 ):
     if year == latest_year:
-        return f"{year} YTD"
+        return (
+            f"{year} YTD"
+        )
 
-    return str(year)
+    return str(
+        year
+    )
 
 
 def get_existing_annual_rows():
-    pages = query_all_pages(
-        STRATEGY1_ANNUAL_DATA_SOURCE_ID
+    pages = (
+        query_all_pages(
+            STRATEGY1_ANNUAL_DATA_SOURCE_ID
+        )
     )
 
     result = {}
 
     for page in pages:
-        year = get_number_value(
-            page,
-            "Year",
+
+        year = (
+            get_number_value(
+                page,
+                "Year",
+            )
         )
 
         if year is None:
             continue
 
-        year = int(year)
+        year = int(
+            year
+        )
 
         if year in result:
             raise RuntimeError(
-                f"Duplicate Annual year: {year}"
+                f"Duplicate Annual "
+                f"year: {year}"
             )
 
-        result[year] = page
+        result[
+            year
+        ] = page
 
     return result
 
@@ -1049,19 +1645,26 @@ def create_annual_row(
         "pages",
         {
             "parent": {
-                "type": "data_source_id",
+                "type": (
+                    "data_source_id"
+                ),
                 "data_source_id": (
                     STRATEGY1_ANNUAL_DATA_SOURCE_ID
                 ),
             },
 
             "properties": {
-                "Period": notion_title(
-                    period
+
+                "Period": (
+                    notion_title(
+                        period
+                    )
                 ),
 
-                "Year": notion_number(
-                    year
+                "Year": (
+                    notion_number(
+                        year
+                    )
                 ),
 
                 "Strategy 1": (
@@ -1099,12 +1702,17 @@ def update_annual_row(
         f"pages/{page_id}",
         {
             "properties": {
-                "Period": notion_title(
-                    period
+
+                "Period": (
+                    notion_title(
+                        period
+                    )
                 ),
 
-                "Year": notion_number(
-                    year
+                "Year": (
+                    notion_number(
+                        year
+                    )
                 ),
 
                 "Strategy 1": (
@@ -1129,7 +1737,9 @@ def update_annual_row(
     )
 
 
-def annual_row_is_complete(page):
+def annual_row_is_complete(
+    page,
+):
     return all(
         get_number_value(
             page,
@@ -1151,29 +1761,39 @@ def sync_one_year(
     latest_year,
 ):
     year = int(
-        row["Year"]
+        row[
+            "Year"
+        ]
     )
 
-    period = annual_period_name(
-        year,
-        latest_year,
+    period = (
+        annual_period_name(
+            year,
+            latest_year,
+        )
     )
 
     strategy_return = (
         normalize_performance(
-            row["Strategy 1"]
+            row[
+                "Strategy 1"
+            ]
         )
     )
 
     qqq_return = (
         normalize_performance(
-            row["QQQ"]
+            row[
+                "QQQ"
+            ]
         )
     )
 
     spy_return = (
         normalize_performance(
-            row["SPY"]
+            row[
+                "SPY"
+            ]
         )
     )
 
@@ -1182,6 +1802,7 @@ def sync_one_year(
     )
 
     if page is None:
+
         create_annual_row(
             year,
             period,
@@ -1197,6 +1818,7 @@ def sync_one_year(
         return "created"
 
     is_same = (
+
         get_title_value(
             page,
             "Period",
@@ -1204,6 +1826,7 @@ def sync_one_year(
         == period
 
         and
+
         numbers_equal(
             get_number_value(
                 page,
@@ -1213,6 +1836,7 @@ def sync_one_year(
         )
 
         and
+
         numbers_equal(
             get_number_value(
                 page,
@@ -1222,6 +1846,7 @@ def sync_one_year(
         )
 
         and
+
         numbers_equal(
             get_number_value(
                 page,
@@ -1232,6 +1857,7 @@ def sync_one_year(
     )
 
     if is_same:
+
         print(
             f"⏭️ {period}: unchanged"
         )
@@ -1239,7 +1865,9 @@ def sync_one_year(
         return "unchanged"
 
     update_annual_row(
-        page["id"],
+        page[
+            "id"
+        ],
         period,
         year,
         strategy_return,
@@ -1257,13 +1885,19 @@ def sync_one_year(
 def sync_annual_performance():
     print()
     print("=" * 70)
-    print("NOTION ANNUAL PERFORMANCE")
+    print(
+        "NOTION ANNUAL PERFORMANCE"
+    )
     print("=" * 70)
 
-    annual = load_annual_results()
+    annual = (
+        load_annual_results()
+    )
 
     latest_year = int(
-        annual["Year"].max()
+        annual[
+            "Year"
+        ].max()
     )
 
     existing = (
@@ -1272,9 +1906,14 @@ def sync_annual_performance():
 
     needs_full_sync = False
 
-    for _, row in annual.iterrows():
+    for _, row in (
+        annual.iterrows()
+    ):
+
         year = int(
-            row["Year"]
+            row[
+                "Year"
+            ]
         )
 
         page = existing.get(
@@ -1283,7 +1922,8 @@ def sync_annual_performance():
 
         if (
             page is None
-            or not annual_row_is_complete(
+            or
+            not annual_row_is_complete(
                 page
             )
         ):
@@ -1291,6 +1931,7 @@ def sync_annual_performance():
             break
 
     if needs_full_sync:
+
         years_to_sync = (
             annual.copy()
         )
@@ -1305,6 +1946,7 @@ def sync_annual_performance():
         )
 
     else:
+
         years_to_sync = (
             annual
             .tail(2)
@@ -1320,13 +1962,22 @@ def sync_annual_performance():
         )
 
     print()
-    print("Checking periods:")
+    print(
+        "Checking periods:"
+    )
 
-    for _, row in years_to_sync.iterrows():
+    for _, row in (
+        years_to_sync.iterrows()
+    ):
+
         print(
             " ",
             annual_period_name(
-                int(row["Year"]),
+                int(
+                    row[
+                        "Year"
+                    ]
+                ),
                 latest_year,
             ),
         )
@@ -1337,11 +1988,16 @@ def sync_annual_performance():
     created = 0
     unchanged = 0
 
-    for _, row in years_to_sync.iterrows():
-        result = sync_one_year(
-            row,
-            existing,
-            latest_year,
+    for _, row in (
+        years_to_sync.iterrows()
+    ):
+
+        result = (
+            sync_one_year(
+                row,
+                existing,
+                latest_year,
+            )
         )
 
         if result == "updated":
@@ -1358,24 +2014,31 @@ def sync_annual_performance():
         )
 
     print()
+
     print(
         "Years checked :",
-        len(years_to_sync),
+        len(
+            years_to_sync
+        ),
     )
+
     print(
         "Updated       :",
         updated,
     )
+
     print(
         "Created       :",
         created,
     )
+
     print(
         "Unchanged     :",
         unchanged,
     )
 
     print()
+
     print(
         "✅ Strategy 1 Annual "
         "Performance synced to Notion"
@@ -1403,14 +2066,18 @@ def load_position_history():
 
     missing = (
         required
-        - set(history.columns)
+        - set(
+            history.columns
+        )
     )
 
     if missing:
         raise RuntimeError(
             "Position History CSV missing: "
             + ", ".join(
-                sorted(missing)
+                sorted(
+                    missing
+                )
             )
         )
 
@@ -1425,16 +2092,15 @@ def load_position_history():
         ]
     ].copy()
 
-    if history.isna().any().any():
-        bad = history[
-            history.isna().any(
-                axis=1
-            )
-        ]
-
+    if (
+        history
+        .isna()
+        .any()
+        .any()
+    ):
         raise RuntimeError(
             "Position History contains "
-            f"missing values:\n{bad}"
+            "missing values."
         )
 
     history[
@@ -1445,8 +2111,12 @@ def load_position_history():
         ]
         .map(
             lambda value:
-            pd.Timestamp(value)
-            .strftime("%Y-%m-%d")
+            pd.Timestamp(
+                value
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
     )
 
@@ -1458,13 +2128,18 @@ def load_position_history():
         ]
         .map(
             lambda value:
-            pd.Timestamp(value)
-            .strftime("%Y-%m-%d")
+            pd.Timestamp(
+                value
+            )
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
     )
 
-    history = (
-        history.sort_values(
+    return (
+        history
+        .sort_values(
             [
                 "Signal Date",
                 "Execute Date",
@@ -1475,40 +2150,50 @@ def load_position_history():
         )
     )
 
-    return history
-
 
 def history_key(
     signal_date,
     execute_date,
 ):
     return (
-        str(signal_date),
-        str(execute_date),
+        str(
+            signal_date
+        ),
+        str(
+            execute_date
+        ),
     )
 
 
 def get_existing_history_rows():
-    pages = query_all_pages(
-        STRATEGY1_HISTORY_DATA_SOURCE_ID
+    pages = (
+        query_all_pages(
+            STRATEGY1_HISTORY_DATA_SOURCE_ID
+        )
     )
 
     result = {}
 
     for page in pages:
-        signal_date = get_date_value(
-            page,
-            "Signal Date",
+
+        signal_date = (
+            get_date_value(
+                page,
+                "Signal Date",
+            )
         )
 
-        execute_date = get_date_value(
-            page,
-            "Execute Date",
+        execute_date = (
+            get_date_value(
+                page,
+                "Execute Date",
+            )
         )
 
         if (
             signal_date is None
-            or execute_date is None
+            or
+            execute_date is None
         ):
             continue
 
@@ -1516,19 +2201,25 @@ def get_existing_history_rows():
             pd.Timestamp(
                 signal_date
             )
-            .strftime("%Y-%m-%d")
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
 
         execute_date = (
             pd.Timestamp(
                 execute_date
             )
-            .strftime("%Y-%m-%d")
+            .strftime(
+                "%Y-%m-%d"
+            )
         )
 
-        key = history_key(
-            signal_date,
-            execute_date,
+        key = (
+            history_key(
+                signal_date,
+                execute_date,
+            )
         )
 
         if key in result:
@@ -1537,46 +2228,77 @@ def get_existing_history_rows():
                 f"record found: {key}"
             )
 
-        result[key] = page
+        result[
+            key
+        ] = page
 
     return result
 
 
-def create_history_row(row):
+def create_history_row(
+    row,
+):
     notion_request(
         "POST",
         "pages",
         {
             "parent": {
-                "type": "data_source_id",
+                "type": (
+                    "data_source_id"
+                ),
                 "data_source_id": (
                     STRATEGY1_HISTORY_DATA_SOURCE_ID
                 ),
             },
 
             "properties": {
-                "Change": notion_title(
-                    row["Change"]
+
+                "Change": (
+                    notion_title(
+                        row[
+                            "Change"
+                        ]
+                    )
                 ),
 
-                "Signal Date": notion_date(
-                    row["Signal Date"]
+                "Signal Date": (
+                    notion_date(
+                        row[
+                            "Signal Date"
+                        ]
+                    )
                 ),
 
-                "Execute Date": notion_date(
-                    row["Execute Date"]
+                "Execute Date": (
+                    notion_date(
+                        row[
+                            "Execute Date"
+                        ]
+                    )
                 ),
 
-                "From": notion_select(
-                    row["From"]
+                "From": (
+                    notion_select(
+                        row[
+                            "From"
+                        ]
+                    )
                 ),
 
-                "To": notion_select(
-                    row["To"]
+                "To": (
+                    notion_select(
+                        row[
+                            "To"
+                        ]
+                    )
                 ),
 
-                "Reason": notion_text(
-                    row["Reason"]
+                "Reason": (
+                    notion_text(
+                        row[
+                            "Reason"
+                        ]
+                    )
                 ),
             },
         },
@@ -1592,28 +2314,53 @@ def update_history_row(
         f"pages/{page_id}",
         {
             "properties": {
-                "Change": notion_title(
-                    row["Change"]
+
+                "Change": (
+                    notion_title(
+                        row[
+                            "Change"
+                        ]
+                    )
                 ),
 
-                "Signal Date": notion_date(
-                    row["Signal Date"]
+                "Signal Date": (
+                    notion_date(
+                        row[
+                            "Signal Date"
+                        ]
+                    )
                 ),
 
-                "Execute Date": notion_date(
-                    row["Execute Date"]
+                "Execute Date": (
+                    notion_date(
+                        row[
+                            "Execute Date"
+                        ]
+                    )
                 ),
 
-                "From": notion_select(
-                    row["From"]
+                "From": (
+                    notion_select(
+                        row[
+                            "From"
+                        ]
+                    )
                 ),
 
-                "To": notion_select(
-                    row["To"]
+                "To": (
+                    notion_select(
+                        row[
+                            "To"
+                        ]
+                    )
                 ),
 
-                "Reason": notion_text(
-                    row["Reason"]
+                "Reason": (
+                    notion_text(
+                        row[
+                            "Reason"
+                        ]
+                    )
                 ),
             }
         },
@@ -1623,11 +2370,6 @@ def update_history_row(
 def archive_history_row(
     page_id,
 ):
-    """
-    Used only for a recent record that existed
-    before but disappears after data repair.
-    """
-
     notion_request(
         "PATCH",
         f"pages/{page_id}",
@@ -1642,60 +2384,82 @@ def history_page_matches(
     row,
 ):
     return (
+
         get_title_value(
             page,
             "Change",
         )
-        == row["Change"]
+        == row[
+            "Change"
+        ]
 
         and
+
         dates_equal(
             get_date_value(
                 page,
                 "Signal Date",
             ),
-            row["Signal Date"],
+            row[
+                "Signal Date"
+            ],
         )
 
         and
+
         dates_equal(
             get_date_value(
                 page,
                 "Execute Date",
             ),
-            row["Execute Date"],
+            row[
+                "Execute Date"
+            ],
         )
 
         and
+
         get_select_value(
             page,
             "From",
         )
-        == row["From"]
+        == row[
+            "From"
+        ]
 
         and
+
         get_select_value(
             page,
             "To",
         )
-        == row["To"]
+        == row[
+            "To"
+        ]
 
         and
+
         get_rich_text_value(
             page,
             "Reason",
         )
-        == row["Reason"]
+        == row[
+            "Reason"
+        ]
     )
 
 
 def sync_position_history():
     print()
     print("=" * 70)
-    print("NOTION POSITION HISTORY")
+    print(
+        "NOTION POSITION HISTORY"
+    )
     print("=" * 70)
 
-    history = load_position_history()
+    history = (
+        load_position_history()
+    )
 
     if history.empty:
         raise RuntimeError(
@@ -1712,7 +2476,9 @@ def sync_position_history():
 
     latest_date = (
         pd.Timestamp(
-            latest_status["Signal Date"]
+            latest_status[
+                "Signal Date"
+            ]
         )
         .normalize()
     )
@@ -1724,40 +2490,42 @@ def sync_position_history():
         )
     )
 
-    # --------------------------------------------------------
-    # Determine whether history is fully initialized.
-    #
-    # We only require OLD historical rows to exist.
-    # A new recent trade should not trigger a full resync.
-    # --------------------------------------------------------
-
     old_history = history[
         pd.to_datetime(
-            history["Signal Date"]
+            history[
+                "Signal Date"
+            ]
         )
         < cutoff_date
     ]
 
     missing_old_history = False
 
-    for _, row in old_history.iterrows():
-        key = history_key(
-            row["Signal Date"],
-            row["Execute Date"],
+    for _, row in (
+        old_history.iterrows()
+    ):
+
+        key = (
+            history_key(
+                row[
+                    "Signal Date"
+                ],
+                row[
+                    "Execute Date"
+                ],
+            )
         )
 
         if key not in existing:
             missing_old_history = True
             break
 
-    # --------------------------------------------------------
-    # FIRST / INCOMPLETE INITIALIZATION
-    # --------------------------------------------------------
-
     if (
         not existing
-        or missing_old_history
+        or
+        missing_old_history
     ):
+
         rows_to_sync = (
             history.copy()
         )
@@ -1773,14 +2541,13 @@ def sync_position_history():
             "Syncing complete history."
         )
 
-    # --------------------------------------------------------
-    # NORMAL MAINTENANCE
-    # --------------------------------------------------------
-
     else:
+
         rows_to_sync = history[
             pd.to_datetime(
-                history["Signal Date"]
+                history[
+                    "Signal Date"
+                ]
             )
             >= cutoff_date
         ].copy()
@@ -1793,18 +2560,24 @@ def sync_position_history():
 
         print(
             f"Checking recent "
-            f"{HISTORY_REPAIR_DAYS} days only."
+            f"{HISTORY_REPAIR_DAYS} "
+            f"days only."
         )
 
     print()
+
     print(
         "Backtest position changes :",
-        len(history),
+        len(
+            history
+        ),
     )
 
     print(
         "Rows to check             :",
-        len(rows_to_sync),
+        len(
+            rows_to_sync
+        ),
     )
 
     print()
@@ -1816,10 +2589,19 @@ def sync_position_history():
 
     current_keys = set()
 
-    for _, row in rows_to_sync.iterrows():
-        key = history_key(
-            row["Signal Date"],
-            row["Execute Date"],
+    for _, row in (
+        rows_to_sync.iterrows()
+    ):
+
+        key = (
+            history_key(
+                row[
+                    "Signal Date"
+                ],
+                row[
+                    "Execute Date"
+                ],
+            )
         )
 
         current_keys.add(
@@ -1831,6 +2613,7 @@ def sync_position_history():
         )
 
         if page is None:
+
             create_history_row(
                 row
             )
@@ -1858,7 +2641,9 @@ def sync_position_history():
             continue
 
         update_history_row(
-            page["id"],
+            page[
+                "id"
+            ],
             row,
         )
 
@@ -1875,32 +2660,35 @@ def sync_position_history():
             WRITE_DELAY_SECONDS
         )
 
-    # --------------------------------------------------------
-    # In normal maintenance mode:
-    #
-    # If a recent Notion record no longer exists in the
-    # recalculated backtest, archive the stale row.
-    #
-    # We NEVER touch older historical rows here.
-    # --------------------------------------------------------
-
     if not full_sync:
-        for key, page in existing.items():
+
+        for (
+            key,
+            page,
+        ) in existing.items():
+
             signal_date = (
                 pd.Timestamp(
-                    key[0]
+                    key[
+                        0
+                    ]
                 )
                 .normalize()
             )
 
-            if signal_date < cutoff_date:
+            if (
+                signal_date
+                < cutoff_date
+            ):
                 continue
 
             if key in current_keys:
                 continue
 
             archive_history_row(
-                page["id"]
+                page[
+                    "id"
+                ]
             )
 
             archived += 1
@@ -1956,16 +2744,19 @@ def main():
         "to Notion..."
     )
 
-    # 1. Current Status
+    # 1. Strategy 1 detailed Current Status
     sync_current_status()
 
-    # 2. Current month + previous month
+    # 2. Main page Current Positions
+    sync_main_current_positions()
+
+    # 3. Current month + previous month
     sync_monthly_performance()
 
-    # 3. Current year + previous year
+    # 4. Current year + previous year
     sync_annual_performance()
 
-    # 4. Position History
+    # 5. Recent Position History maintenance
     sync_position_history()
 
     print()
