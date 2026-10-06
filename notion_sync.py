@@ -1,5 +1,7 @@
 import json
+import math
 import os
+import time
 import urllib.error
 import urllib.request
 
@@ -17,13 +19,22 @@ STRATEGY1_STATUS_DATA_SOURCE_ID = os.environ[
     "STRATEGY1_STATUS_DATA_SOURCE_ID"
 ]
 
+STRATEGY1_MONTHLY_DATA_SOURCE_ID = os.environ[
+    "STRATEGY1_MONTHLY_DATA_SOURCE_ID"
+]
+
 NOTION_VERSION = "2025-09-03"
 
-SUMMARY_FILE = (
-    "output/strategy1_summary.json"
-)
+SUMMARY_FILE = "output/strategy1_summary.json"
+MONTHLY_FILE = "output/strategy1_monthly.csv"
 
 NYSE = mcal.get_calendar("NYSE")
+
+# Avoid hammering the Notion API when the first sync
+# needs to update many rows.
+WRITE_DELAY_SECONDS = 0.35
+
+NUMBER_TOLERANCE = 1e-10
 
 
 # ============================================================
@@ -36,8 +47,9 @@ def notion_request(
     body=None,
 ):
     """
-    Make a Notion API request without ever
-    printing the token.
+    Make a Notion API request.
+
+    The token is never printed.
     """
 
     url = (
@@ -106,202 +118,82 @@ def notion_request(
         ) from e
 
 
-# ============================================================
-# FIND STRATEGY 1 STATUS ROW
-# ============================================================
-
-def find_current_status_page():
+def query_all_pages(
+    data_source_id,
+):
     """
-    Find the existing Current Status row whose Name is:
+    Query every row from a Notion data source.
 
-        Strategy 1
-
-    We UPDATE this page.
-
-    We do NOT create another row.
+    Handles pagination automatically.
     """
 
-    result = notion_request(
-        "POST",
-        (
-            "data_sources/"
-            f"{STRATEGY1_STATUS_DATA_SOURCE_ID}"
-            "/query"
-        ),
-        {
-            "filter": {
-                "property": "Name",
-                "title": {
-                    "equals": "Strategy 1"
+    pages = []
+    start_cursor = None
+
+    while True:
+
+        body = {
+            "page_size": 100,
+        }
+
+        if start_cursor is not None:
+            body["start_cursor"] = (
+                start_cursor
+            )
+
+        result = notion_request(
+            "POST",
+            (
+                "data_sources/"
+                f"{data_source_id}"
+                "/query"
+            ),
+            body,
+        )
+
+        pages.extend(
+            result.get(
+                "results",
+                [],
+            )
+        )
+
+        if not result.get(
+            "has_more",
+            False,
+        ):
+            break
+
+        start_cursor = result.get(
+            "next_cursor"
+        )
+
+        if not start_cursor:
+            break
+
+    return pages
+
+
+# ============================================================
+# PROPERTY BUILDERS
+# ============================================================
+
+def notion_title(
+    value,
+):
+    return {
+        "title": [
+            {
+                "type": "text",
+                "text": {
+                    "content": str(
+                        value
+                    )
                 },
-            },
-            "page_size": 10,
-        },
-    )
-
-    pages = result.get(
-        "results",
-        [],
-    )
-
-    if len(pages) == 0:
-
-        raise RuntimeError(
-            "Could not find the "
-            "'Strategy 1' row in "
-            "Strategy 1 Current Status."
-        )
-
-    if len(pages) > 1:
-
-        raise RuntimeError(
-            "More than one row named "
-            "'Strategy 1' was found. "
-            "Refusing to guess which "
-            "one should be updated."
-        )
-
-    return pages[0]["id"]
-
-
-# ============================================================
-# NEXT TRADING DAY
-# ============================================================
-
-def get_next_trading_day(
-    signal_date,
-):
-    """
-    Signal is generated at today's close.
-
-    Execute Date must therefore be the NEXT
-    actual US trading session.
-
-    Handles:
-    - weekends
-    - holidays
-    """
-
-    signal_date = pd.Timestamp(
-        signal_date
-    ).normalize()
-
-    start_date = (
-        signal_date
-        + pd.Timedelta(days=1)
-    )
-
-    end_date = (
-        signal_date
-        + pd.Timedelta(days=14)
-    )
-
-    schedule = NYSE.schedule(
-        start_date=start_date.date(),
-        end_date=end_date.date(),
-    )
-
-    if schedule.empty:
-
-        raise RuntimeError(
-            "Could not determine "
-            "next trading day."
-        )
-
-    return (
-        pd.Timestamp(
-            schedule.index[0]
-        )
-        .strftime("%Y-%m-%d")
-    )
-
-
-# ============================================================
-# DATA SOURCE DISPLAY
-# ============================================================
-
-def short_source_name(
-    source,
-):
-    """
-    Convert internal source names into
-    cleaner Notion display names.
-    """
-
-    mapping = {
-        "daily": "daily",
-        "5m_fallback": "5m",
-        "1m_fallback": "1m",
+            }
+        ]
     }
 
-    return mapping.get(
-        source,
-        source,
-    )
-
-
-def build_data_source_text(
-    data_sources,
-):
-    """
-    Examples:
-
-    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
-
-    or:
-
-    Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
-    """
-
-    order = [
-        "NDX",
-        "SPX",
-        "QQQ",
-        "SPY",
-        "AGG",
-    ]
-
-    grouped = {}
-
-    for ticker in order:
-
-        source = short_source_name(
-            data_sources[
-                ticker
-            ]
-        )
-
-        grouped.setdefault(
-            source,
-            [],
-        ).append(
-            ticker
-        )
-
-    parts = [
-        "Yahoo"
-    ]
-
-    for source, tickers in (
-        grouped.items()
-    ):
-
-        names = "/".join(
-            tickers
-        )
-
-        parts.append(
-            f"{names}: {source}"
-        )
-
-    return " | ".join(
-        parts
-    )
-
-
-# ============================================================
-# PROPERTY HELPERS
-# ============================================================
 
 def notion_text(
     value,
@@ -365,6 +257,338 @@ def notion_date(
 
 
 # ============================================================
+# PROPERTY READERS
+# ============================================================
+
+def get_title_value(
+    page,
+    property_name,
+):
+    prop = (
+        page
+        .get("properties", {})
+        .get(property_name, {})
+    )
+
+    title = prop.get(
+        "title",
+        [],
+    )
+
+    if not title:
+        return None
+
+    parts = []
+
+    for item in title:
+
+        plain_text = item.get(
+            "plain_text"
+        )
+
+        if plain_text is not None:
+            parts.append(
+                plain_text
+            )
+
+    return "".join(
+        parts
+    )
+
+
+def get_number_value(
+    page,
+    property_name,
+):
+    prop = (
+        page
+        .get("properties", {})
+        .get(property_name, {})
+    )
+
+    return prop.get(
+        "number"
+    )
+
+
+def get_date_value(
+    page,
+    property_name,
+):
+    prop = (
+        page
+        .get("properties", {})
+        .get(property_name, {})
+    )
+
+    date = prop.get(
+        "date"
+    )
+
+    if not date:
+        return None
+
+    return date.get(
+        "start"
+    )
+
+
+# ============================================================
+# VALUE COMPARISON
+# ============================================================
+
+def numbers_equal(
+    current,
+    expected,
+):
+    if current is None:
+        return False
+
+    try:
+        current = float(
+            current
+        )
+
+        expected = float(
+            expected
+        )
+
+    except (
+        TypeError,
+        ValueError,
+    ):
+        return False
+
+    if (
+        not math.isfinite(current)
+        or not math.isfinite(expected)
+    ):
+        return False
+
+    return math.isclose(
+        current,
+        expected,
+        rel_tol=0,
+        abs_tol=NUMBER_TOLERANCE,
+    )
+
+
+def dates_equal(
+    current,
+    expected,
+):
+    if current is None:
+        return False
+
+    try:
+
+        current_date = (
+            pd.Timestamp(current)
+            .strftime("%Y-%m-%d")
+        )
+
+        expected_date = (
+            pd.Timestamp(expected)
+            .strftime("%Y-%m-%d")
+        )
+
+        return (
+            current_date
+            == expected_date
+        )
+
+    except Exception:
+        return False
+
+
+# ============================================================
+# CURRENT STATUS ROW
+# ============================================================
+
+def find_current_status_page():
+    """
+    Find:
+
+        Name = Strategy 1
+
+    inside Strategy 1 Current Status.
+    """
+
+    result = notion_request(
+        "POST",
+        (
+            "data_sources/"
+            f"{STRATEGY1_STATUS_DATA_SOURCE_ID}"
+            "/query"
+        ),
+        {
+            "filter": {
+                "property": "Name",
+                "title": {
+                    "equals": (
+                        "Strategy 1"
+                    )
+                },
+            },
+            "page_size": 10,
+        },
+    )
+
+    pages = result.get(
+        "results",
+        [],
+    )
+
+    if len(pages) == 0:
+
+        raise RuntimeError(
+            "Could not find "
+            "'Strategy 1' row in "
+            "Current Status."
+        )
+
+    if len(pages) > 1:
+
+        raise RuntimeError(
+            "More than one row named "
+            "'Strategy 1' was found "
+            "in Current Status."
+        )
+
+    return pages[0]["id"]
+
+
+# ============================================================
+# NEXT TRADING DAY
+# ============================================================
+
+def get_next_trading_day(
+    signal_date,
+):
+    """
+    Signal is confirmed at today's close.
+
+    Execution happens at the next actual
+    US market session open.
+    """
+
+    signal_date = (
+        pd.Timestamp(
+            signal_date
+        )
+        .normalize()
+    )
+
+    start_date = (
+        signal_date
+        + pd.Timedelta(days=1)
+    )
+
+    end_date = (
+        signal_date
+        + pd.Timedelta(days=14)
+    )
+
+    schedule = NYSE.schedule(
+        start_date=start_date.date(),
+        end_date=end_date.date(),
+    )
+
+    if schedule.empty:
+
+        raise RuntimeError(
+            "Could not determine "
+            "next trading day."
+        )
+
+    return (
+        pd.Timestamp(
+            schedule.index[0]
+        )
+        .strftime("%Y-%m-%d")
+    )
+
+
+# ============================================================
+# DATA SOURCE DISPLAY
+# ============================================================
+
+def short_source_name(
+    source,
+):
+    mapping = {
+        "daily": "daily",
+        "5m_fallback": "5m",
+        "1m_fallback": "1m",
+    }
+
+    return mapping.get(
+        source,
+        source,
+    )
+
+
+def build_data_source_text(
+    data_sources,
+):
+    """
+    Examples:
+
+    Yahoo | NDX/SPX: daily | QQQ/SPY/AGG: 5m
+
+    Yahoo | NDX/SPX/QQQ/SPY/AGG: daily
+    """
+
+    order = [
+        "NDX",
+        "SPX",
+        "QQQ",
+        "SPY",
+        "AGG",
+    ]
+
+    grouped = {}
+
+    for ticker in order:
+
+        source = (
+            short_source_name(
+                data_sources[
+                    ticker
+                ]
+            )
+        )
+
+        grouped.setdefault(
+            source,
+            [],
+        ).append(
+            ticker
+        )
+
+    parts = [
+        "Yahoo"
+    ]
+
+    for (
+        source,
+        tickers,
+    ) in grouped.items():
+
+        names = "/".join(
+            tickers
+        )
+
+        parts.append(
+            f"{names}: {source}"
+        )
+
+    return " | ".join(
+        parts
+    )
+
+
+# ============================================================
 # LOAD STRATEGY OUTPUT
 # ============================================================
 
@@ -397,7 +621,7 @@ def load_strategy_output():
 
 
 # ============================================================
-# SYNC CURRENT STATUS
+# CURRENT STATUS SYNC
 # ============================================================
 
 def sync_current_status():
@@ -406,29 +630,15 @@ def sync_current_status():
         load_strategy_output()
     )
 
-    # --------------------------------------------------------
-    # Signal Date
-    # --------------------------------------------------------
-
     signal_date = status[
         "Signal Date"
     ]
-
-    # --------------------------------------------------------
-    # Execute Date
-    #
-    # Must be next ACTUAL trading day.
-    # --------------------------------------------------------
 
     execute_date = (
         get_next_trading_day(
             signal_date
         )
     )
-
-    # --------------------------------------------------------
-    # Human-readable data source
-    # --------------------------------------------------------
 
     data_source_text = (
         build_data_source_text(
@@ -438,17 +648,9 @@ def sync_current_status():
         )
     )
 
-    # --------------------------------------------------------
-    # Find existing Strategy 1 row
-    # --------------------------------------------------------
-
     page_id = (
         find_current_status_page()
     )
-
-    # --------------------------------------------------------
-    # Last Updated
-    # --------------------------------------------------------
 
     last_updated = (
         pd.Timestamp.now(
@@ -456,10 +658,6 @@ def sync_current_status():
         )
         .isoformat()
     )
-
-    # --------------------------------------------------------
-    # Properties to update
-    # --------------------------------------------------------
 
     properties = {
 
@@ -568,10 +766,6 @@ def sync_current_status():
         ),
     }
 
-    # --------------------------------------------------------
-    # Update Notion row
-    # --------------------------------------------------------
-
     notion_request(
         "PATCH",
         f"pages/{page_id}",
@@ -581,10 +775,6 @@ def sync_current_status():
             )
         },
     )
-
-    # --------------------------------------------------------
-    # Console output
-    # --------------------------------------------------------
 
     print()
     print("=" * 70)
@@ -643,6 +833,465 @@ def sync_current_status():
 
 
 # ============================================================
+# LOAD MONTHLY RESULTS
+# ============================================================
+
+def load_monthly_results():
+    """
+    Read:
+
+        output/strategy1_monthly.csv
+
+    Expected columns:
+
+        Month
+        Strategy 1
+        QQQ
+        SPY
+    """
+
+    monthly = pd.read_csv(
+        MONTHLY_FILE,
+        dtype={
+            "Month": str,
+        },
+    )
+
+    required_columns = {
+        "Month",
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    }
+
+    missing = (
+        required_columns
+        - set(
+            monthly.columns
+        )
+    )
+
+    if missing:
+
+        raise RuntimeError(
+            "Monthly CSV missing "
+            "required column(s): "
+            + ", ".join(
+                sorted(missing)
+            )
+        )
+
+    monthly = monthly[
+        [
+            "Month",
+            "Strategy 1",
+            "QQQ",
+            "SPY",
+        ]
+    ].copy()
+
+    monthly = monthly.sort_values(
+        "Month"
+    )
+
+    for column in [
+        "Strategy 1",
+        "QQQ",
+        "SPY",
+    ]:
+
+        if monthly[
+            column
+        ].isna().any():
+
+            bad_months = (
+                monthly.loc[
+                    monthly[
+                        column
+                    ].isna(),
+                    "Month",
+                ]
+                .tolist()
+            )
+
+            raise RuntimeError(
+                f"Monthly CSV contains "
+                f"NaN in {column}: "
+                f"{bad_months}"
+            )
+
+    return monthly
+
+
+# ============================================================
+# MONTHLY NOTION ROW INDEX
+# ============================================================
+
+def get_existing_month_rows():
+    """
+    Return:
+
+        {
+            "2026-10": page,
+            "2026-09": page,
+            ...
+        }
+
+    Duplicate Month titles are treated as
+    an error rather than guessed.
+    """
+
+    pages = query_all_pages(
+        STRATEGY1_MONTHLY_DATA_SOURCE_ID
+    )
+
+    result = {}
+
+    for page in pages:
+
+        month = get_title_value(
+            page,
+            "Month",
+        )
+
+        if not month:
+            continue
+
+        if month in result:
+
+            raise RuntimeError(
+                "Duplicate Monthly "
+                f"Performance row found: "
+                f"{month}"
+            )
+
+        result[
+            month
+        ] = page
+
+    return result
+
+
+# ============================================================
+# CREATE MONTHLY ROW
+# ============================================================
+
+def create_month_row(
+    month,
+    month_start,
+    strategy_return,
+    qqq_return,
+    spy_return,
+):
+    """
+    Used automatically in future months if
+    the row does not already exist.
+    """
+
+    result = notion_request(
+        "POST",
+        "pages",
+        {
+            "parent": {
+                "type": (
+                    "data_source_id"
+                ),
+                "data_source_id": (
+                    STRATEGY1_MONTHLY_DATA_SOURCE_ID
+                ),
+            },
+            "properties": {
+
+                "Month": (
+                    notion_title(
+                        month
+                    )
+                ),
+
+                "Month Start": (
+                    notion_date(
+                        month_start
+                    )
+                ),
+
+                "Strategy 1": (
+                    notion_number(
+                        strategy_return
+                    )
+                ),
+
+                "QQQ": (
+                    notion_number(
+                        qqq_return
+                    )
+                ),
+
+                "SPY": (
+                    notion_number(
+                        spy_return
+                    )
+                ),
+            },
+        },
+    )
+
+    return result
+
+
+# ============================================================
+# UPDATE MONTHLY ROW
+# ============================================================
+
+def update_month_row(
+    page_id,
+    month_start,
+    strategy_return,
+    qqq_return,
+    spy_return,
+):
+    notion_request(
+        "PATCH",
+        f"pages/{page_id}",
+        {
+            "properties": {
+
+                "Month Start": (
+                    notion_date(
+                        month_start
+                    )
+                ),
+
+                "Strategy 1": (
+                    notion_number(
+                        strategy_return
+                    )
+                ),
+
+                "QQQ": (
+                    notion_number(
+                        qqq_return
+                    )
+                ),
+
+                "SPY": (
+                    notion_number(
+                        spy_return
+                    )
+                ),
+            }
+        },
+    )
+
+
+# ============================================================
+# MONTHLY SYNC
+# ============================================================
+
+def sync_monthly_performance():
+
+    print()
+    print("=" * 70)
+    print(
+        "NOTION MONTHLY PERFORMANCE"
+    )
+    print("=" * 70)
+
+    monthly = (
+        load_monthly_results()
+    )
+
+    existing = (
+        get_existing_month_rows()
+    )
+
+    updated = 0
+    created = 0
+    unchanged = 0
+
+    for _, row in monthly.iterrows():
+
+        month = str(
+            row["Month"]
+        )
+
+        month_start = (
+            pd.Timestamp(
+                f"{month}-01"
+            )
+            .strftime("%Y-%m-%d")
+        )
+
+        strategy_return = float(
+            row["Strategy 1"]
+        )
+
+        qqq_return = float(
+            row["QQQ"]
+        )
+
+        spy_return = float(
+            row["SPY"]
+        )
+
+        # ----------------------------------------------------
+        # Month does not yet exist in Notion
+        # ----------------------------------------------------
+
+        if month not in existing:
+
+            create_month_row(
+                month=month,
+                month_start=month_start,
+                strategy_return=(
+                    strategy_return
+                ),
+                qqq_return=(
+                    qqq_return
+                ),
+                spy_return=(
+                    spy_return
+                ),
+            )
+
+            created += 1
+
+            print(
+                f"➕ {month}: created"
+            )
+
+            time.sleep(
+                WRITE_DELAY_SECONDS
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # Existing Notion row
+        # ----------------------------------------------------
+
+        page = existing[
+            month
+        ]
+
+        current_month_start = (
+            get_date_value(
+                page,
+                "Month Start",
+            )
+        )
+
+        current_strategy = (
+            get_number_value(
+                page,
+                "Strategy 1",
+            )
+        )
+
+        current_qqq = (
+            get_number_value(
+                page,
+                "QQQ",
+            )
+        )
+
+        current_spy = (
+            get_number_value(
+                page,
+                "SPY",
+            )
+        )
+
+        is_same = (
+            dates_equal(
+                current_month_start,
+                month_start,
+            )
+            and
+            numbers_equal(
+                current_strategy,
+                strategy_return,
+            )
+            and
+            numbers_equal(
+                current_qqq,
+                qqq_return,
+            )
+            and
+            numbers_equal(
+                current_spy,
+                spy_return,
+            )
+        )
+
+        # ----------------------------------------------------
+        # Nothing changed
+        # ----------------------------------------------------
+
+        if is_same:
+
+            unchanged += 1
+
+            continue
+
+        # ----------------------------------------------------
+        # Update changed / blank values
+        # ----------------------------------------------------
+
+        update_month_row(
+            page_id=page["id"],
+            month_start=month_start,
+            strategy_return=(
+                strategy_return
+            ),
+            qqq_return=(
+                qqq_return
+            ),
+            spy_return=(
+                spy_return
+            ),
+        )
+
+        updated += 1
+
+        print(
+            f"✏️ {month}: updated"
+        )
+
+        time.sleep(
+            WRITE_DELAY_SECONDS
+        )
+
+    print()
+
+    print(
+        "Monthly rows in backtest :",
+        len(monthly),
+    )
+
+    print(
+        "Updated                  :",
+        updated,
+    )
+
+    print(
+        "Created                  :",
+        created,
+    )
+
+    print(
+        "Unchanged                :",
+        unchanged,
+    )
+
+    print()
+
+    print(
+        "✅ Strategy 1 Monthly "
+        "Performance synced to Notion"
+    )
+
+
+# ============================================================
 # MAIN
 # ============================================================
 
@@ -650,10 +1299,23 @@ def main():
 
     print(
         "Syncing Strategy 1 "
-        "Current Status to Notion..."
+        "to Notion..."
     )
 
+    # 1. Current Status
     sync_current_status()
+
+    # 2. Monthly Performance
+    sync_monthly_performance()
+
+    print()
+    print("=" * 70)
+
+    print(
+        "✅ Strategy 1 Notion sync completed"
+    )
+
+    print("=" * 70)
 
 
 if __name__ == "__main__":
