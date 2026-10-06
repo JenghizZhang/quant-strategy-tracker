@@ -44,7 +44,7 @@ WRITE_DELAY_SECONDS = 0.35
 # gives us 2 decimal places in displayed percentage.
 # ============================================================
 
-PERFORMANCE_STORAGE_DECIMALS = 4
+PERFORMANCE_STORAGE_DECIMALS = 6
 
 NUMBER_TOLERANCE = 1e-12
 
