@@ -36,6 +36,8 @@ jobs:
 
           STRATEGY1_HISTORY_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_HISTORY_DATA_SOURCE_ID }}
 
+          CURRENT_POSITIONS_DATA_SOURCE_ID: ${{ secrets.CURRENT_POSITIONS_DATA_SOURCE_ID }}
+
         run: python notion_sync.py
 
       - name: Upload backtest results
