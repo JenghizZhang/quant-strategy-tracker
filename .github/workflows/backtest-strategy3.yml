@@ -29,6 +29,9 @@ jobs:
       - name: Run Strategy 3 backtest
         run: python strategy3.py
 
+      - name: Build Strategy 3 Notion payload preview
+        run: python strategy3_notion.py
+
       - name: Upload Strategy 3 output
         if: always()
         uses: actions/upload-artifact@v4
