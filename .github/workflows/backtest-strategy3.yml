@@ -2,6 +2,21 @@ name: Backtest Strategy 3
 
 on:
   workflow_dispatch:
+    inputs:
+      full_rebuild:
+        description: "Full rebuild Strategy 3 Notion history"
+        required: true
+        default: false
+        type: boolean
+
+  schedule:
+    # Run after each US trading day.
+    # 01:30 UTC Tue-Sat = previous US market day evening.
+    - cron: "30 1 * * 2-6"
+
+concurrency:
+  group: strategy3-backtest
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -29,19 +44,17 @@ jobs:
       - name: Run Strategy 3 backtest
         run: python strategy3.py
 
-      - name: Build Strategy 3 Notion payload preview
-        run: python strategy3_notion.py
-
       - name: Sync Strategy 3 to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          FULL_REBUILD: "false"
+          FULL_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_rebuild || false }}
         run: python strategy3_sync.py
 
-      - name: Upload Strategy 3 output
+      - name: Upload Strategy 3 results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: strategy3-output
-          path: output/strategy3_*
+          name: strategy3-results
+          path: output/
+          retention-days: 30
           if-no-files-found: warn
