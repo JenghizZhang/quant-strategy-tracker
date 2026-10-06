@@ -9,7 +9,7 @@ permissions:
 jobs:
   backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
@@ -31,6 +31,12 @@ jobs:
 
       - name: Build Strategy 3 Notion payload preview
         run: python strategy3_notion.py
+
+      - name: Sync Strategy 3 to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          FULL_REBUILD: "true"
+        run: python strategy3_sync.py
 
       - name: Upload Strategy 3 output
         if: always()
