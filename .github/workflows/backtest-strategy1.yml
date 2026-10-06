@@ -40,6 +40,8 @@ jobs:
 
           STRATEGY_OVERVIEW_DATA_SOURCE_ID: ${{ secrets.STRATEGY_OVERVIEW_DATA_SOURCE_ID }}
 
+          ANNUAL_PERFORMANCE_DATA_SOURCE_ID: ${{ secrets.ANNUAL_PERFORMANCE_DATA_SOURCE_ID }}
+
         run: python notion_sync.py
 
       - name: Upload backtest results
