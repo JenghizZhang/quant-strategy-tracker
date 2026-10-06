@@ -24,6 +24,12 @@ jobs:
       - name: Run Strategy 1 backtest
         run: python strategy1.py
 
+      - name: Sync Strategy 1 Current Status to Notion
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          STRATEGY1_STATUS_DATA_SOURCE_ID: ${{ secrets.STRATEGY1_STATUS_DATA_SOURCE_ID }}
+        run: python notion_sync.py
+
       - name: Upload backtest results
         uses: actions/upload-artifact@v4
         with:
