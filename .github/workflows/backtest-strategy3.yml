@@ -9,10 +9,6 @@ on:
         default: false
         type: boolean
 
-  schedule:
-    - cron: "55 19 * * 1-5"
-      timezone: "America/Los_Angeles"
-
 concurrency:
   group: strategy3-backtest
   cancel-in-progress: false
@@ -46,7 +42,8 @@ jobs:
       - name: Sync Strategy 3 to Notion
         env:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          FULL_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_rebuild || false }}
+          FULL_REBUILD: ${{ inputs.full_rebuild }}
+
         run: python strategy3_sync.py
 
       - name: Upload Strategy 3 results
