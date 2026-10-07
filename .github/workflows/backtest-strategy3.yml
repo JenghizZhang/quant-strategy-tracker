@@ -10,9 +10,8 @@ on:
         type: boolean
 
   schedule:
-    # Run after each US trading day.
-    # 01:30 UTC Tue-Sat = previous US market day evening.
-    - cron: "30 1 * * 2-6"
+    - cron: "55 19 * * 1-5"
+      timezone: "America/Los_Angeles"
 
 concurrency:
   group: strategy3-backtest
