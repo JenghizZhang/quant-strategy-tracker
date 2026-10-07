@@ -9,13 +9,12 @@ on:
         type: boolean
         default: false
 
-  schedule:
-    - cron: "40 19 * * 1-5"
-      timezone: "America/Los_Angeles"
-
 concurrency:
   group: strategy1-backtest
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   backtest:
@@ -54,13 +53,15 @@ jobs:
           STRATEGY_OVERVIEW_DATA_SOURCE_ID: ${{ secrets.STRATEGY_OVERVIEW_DATA_SOURCE_ID }}
           ANNUAL_PERFORMANCE_DATA_SOURCE_ID: ${{ secrets.ANNUAL_PERFORMANCE_DATA_SOURCE_ID }}
 
-          FULL_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_rebuild || false }}
+          FULL_REBUILD: ${{ inputs.full_rebuild }}
 
         run: python notion_sync.py
 
       - name: Upload backtest results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: strategy1-backtest-results
           path: output/
           retention-days: 30
+          if-no-files-found: warn
