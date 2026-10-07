@@ -9,13 +9,12 @@ on:
         default: false
         type: boolean
 
-  schedule:
-    - cron: "50 19 * * 1-5"
-      timezone: "America/Los_Angeles"
-
 concurrency:
   group: strategy2-backtest
   cancel-in-progress: false
+
+permissions:
+  contents: read
 
 jobs:
   backtest:
@@ -53,7 +52,8 @@ jobs:
           STRATEGY2_ANNUAL_DATA_SOURCE_ID: ${{ secrets.STRATEGY2_ANNUAL_DATA_SOURCE_ID }}
           STRATEGY2_HISTORY_DATA_SOURCE_ID: ${{ secrets.STRATEGY2_HISTORY_DATA_SOURCE_ID }}
 
-          FULL_REBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.full_rebuild || false }}
+          FULL_REBUILD: ${{ inputs.full_rebuild }}
+
         run: python strategy2_sync.py
 
       - name: Upload Strategy 2 results
